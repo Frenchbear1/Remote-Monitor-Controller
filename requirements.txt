@@ -1,0 +1,5 @@
+PySide6>=6.6.0
+screen-brightness-control>=0.24.2
+astral>=3.2
+tzlocal>=5.2
+geocoder>=1.38.1
