@@ -81,6 +81,14 @@ class AmbientLightService:
 
     @staticmethod
     def _query_lux() -> float | None:
+        startupinfo = None
+        creationflags = 0
+        if hasattr(subprocess, "STARTUPINFO") and hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         try:
             completed = subprocess.run(
                 [
@@ -93,6 +101,8 @@ class AmbientLightService:
                 text=True,
                 timeout=2.6,
                 check=False,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
             )
         except Exception:
             return None
