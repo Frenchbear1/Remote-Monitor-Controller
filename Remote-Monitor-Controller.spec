@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=['src'],
     binaries=[],
-    datas=[('src/brightness_tray/assets', 'brightness_tray/assets')],
+    datas=[('src/brightness_tray/assets', 'src/brightness_tray/assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

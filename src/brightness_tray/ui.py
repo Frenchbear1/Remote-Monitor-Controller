@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime
 import math
 from pathlib import Path
+import sys
 import time as wall_time
 from zoneinfo import ZoneInfo
 
@@ -51,7 +52,31 @@ from .config_store import ConfigStore
 from .location import LocationContext, detect_location_context_from_ip
 from .models import AppConfig, ScheduleRule, clamp_brightness, default_schedule_rules
 
-REFRESH_ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "refresh.png"
+def _resolve_icon_path(filename: str) -> Path | None:
+    module_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        module_dir / "assets" / "icons" / filename,
+    ]
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        pyinstaller_root = Path(meipass)
+        # Support both legacy and corrected PyInstaller data targets.
+        candidate_paths.extend(
+            [
+                pyinstaller_root / "src" / "brightness_tray" / "assets" / "icons" / filename,
+                pyinstaller_root / "brightness_tray" / "assets" / "icons" / filename,
+            ]
+        )
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+REFRESH_ICON_PATH = _resolve_icon_path("refresh.png")
+SETTINGS_ICON_PATH = _resolve_icon_path("settings.png")
 POPUP_EDGE_MARGIN_PX = 10
 
 
@@ -1304,11 +1329,14 @@ class BrightnessControlWindow(QWidget):
             self._persist_config()
 
     def _load_refresh_icon(self) -> QIcon:
-        if REFRESH_ICON_PATH.exists():
+        if REFRESH_ICON_PATH is not None:
             return QIcon(str(REFRESH_ICON_PATH))
         return self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
 
     def _build_settings_icon(self) -> QIcon:
+        if SETTINGS_ICON_PATH is not None:
+            return QIcon(str(SETTINGS_ICON_PATH))
+
         size = 18
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
