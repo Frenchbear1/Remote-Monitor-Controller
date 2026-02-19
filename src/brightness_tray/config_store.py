@@ -13,6 +13,7 @@ from .models import (
     clamp_brightness,
     default_schedule_rules,
 )
+from .themes import normalize_theme_name
 
 
 APP_FOLDER_NAME = "BrightnessTrayScheduler"
@@ -49,6 +50,7 @@ class ConfigStore:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": config.version,
+            "theme": normalize_theme_name(config.theme),
             "link_mode": bool(config.link_mode),
             "ambient_auto_enabled": bool(config.ambient_auto_enabled),
             "last_global_brightness": clamp_brightness(config.last_global_brightness),
@@ -79,6 +81,7 @@ class ConfigStore:
     def _parse(self, data: dict[str, Any]) -> AppConfig:
         config = AppConfig()
         config.version = int(data.get("version", 1))
+        config.theme = normalize_theme_name(str(data.get("theme", config.theme)))
         config.link_mode = bool(data.get("link_mode", True))
         config.ambient_auto_enabled = bool(data.get("ambient_auto_enabled", False))
         config.last_global_brightness = clamp_brightness(

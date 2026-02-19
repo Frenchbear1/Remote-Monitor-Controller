@@ -45,6 +45,7 @@ class ScheduleSettings:
 @dataclass
 class AppConfig:
     version: int = 1
+    theme: str = "dark"
     link_mode: bool = True
     ambient_auto_enabled: bool = False
     last_global_brightness: int = 100

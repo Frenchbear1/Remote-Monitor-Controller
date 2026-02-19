@@ -19,6 +19,7 @@ from .location import detect_location_from_ip
 from .models import AppConfig, ScheduleRule
 from .startup import set_startup_enabled
 from .sun_schedule import SunScheduleEngine
+from .themes import build_stylesheet, normalize_theme_name
 from .ui import BrightnessControlWindow
 
 
@@ -29,6 +30,7 @@ class TrayController(QObject):
 
         self.config_store = ConfigStore()
         self.config = self.config_store.load()
+        self._apply_theme()
         self.brightness_service = BrightnessService()
         self.schedule_engine = SunScheduleEngine()
 
@@ -110,6 +112,7 @@ class TrayController(QObject):
             return
         self.config = updated_config
         self.window.config = updated_config
+        self._apply_theme()
         self._expected_auto_targets = {}
         self._apply_startup_setting()
         self._resolve_location_if_needed()
@@ -246,21 +249,16 @@ class TrayController(QObject):
         self._expected_auto_targets = dict(targets)
         self.window.set_schedule_status(f"Schedule: active ({target_text})")
 
+    def _apply_theme(self) -> None:
+        theme_name = normalize_theme_name(self.config.theme)
+        self.config.theme = theme_name
+        self.app.setStyleSheet(build_stylesheet(theme_name))
+
 
 def run() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Brightness Tray")
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(
-        """
-        QPushButton:checked,
-        QPushButton:pressed,
-        QToolButton:checked,
-        QToolButton:pressed {
-            color: white;
-        }
-        """
-    )
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(

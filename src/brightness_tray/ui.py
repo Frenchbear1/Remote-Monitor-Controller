@@ -20,6 +20,9 @@ from PySide6.QtGui import (
     QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -51,6 +54,14 @@ from .brightness_service import BrightnessService, MonitorHandle, PictureControl
 from .config_store import ConfigStore
 from .location import LocationContext, detect_location_context_from_ip
 from .models import AppConfig, ScheduleRule, clamp_brightness, default_schedule_rules
+from .themes import (
+    THEME_DARK,
+    THEME_GRAY,
+    THEME_LIGHT,
+    THEME_SAND,
+    build_stylesheet,
+    normalize_theme_name,
+)
 
 def _resolve_icon_path(filename: str) -> Path | None:
     module_dir = Path(__file__).resolve().parent
@@ -78,6 +89,23 @@ def _resolve_icon_path(filename: str) -> Path | None:
 REFRESH_ICON_PATH = _resolve_icon_path("refresh.png")
 SETTINGS_ICON_PATH = _resolve_icon_path("settings.png")
 POPUP_EDGE_MARGIN_PX = 10
+POPUP_TASKBAR_CLEARANCE_PX = 8
+
+
+def _bottom_right_popup_position(widget: QWidget, available) -> QPoint:
+    frame = widget.frameGeometry()
+    desired_x = available.right() - frame.width() - POPUP_EDGE_MARGIN_PX + 1
+    desired_y = (
+        available.bottom()
+        - frame.height()
+        - (POPUP_EDGE_MARGIN_PX + POPUP_TASKBAR_CLEARANCE_PX)
+        + 1
+    )
+    max_x = available.right() - frame.width() + 1
+    max_y = available.bottom() - frame.height() + 1
+    target_x = max(available.left(), min(desired_x, max_x))
+    target_y = available.top() if desired_y < available.top() else min(desired_y, max_y)
+    return QPoint(target_x, target_y)
 
 
 def _apply_native_rounded_corners(widget: QWidget) -> None:
@@ -246,21 +274,18 @@ class PictureControlsDialog(QDialog):
         self.monitors = monitors
 
         self.setWindowTitle("Monitor Picture Controls")
-        self.setMinimumWidth(700)
-        self.resize(760, 520)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setMinimumWidth(620)
+        self.resize(700, 420)
         _apply_rounded_popup_chrome(self, "pictureControlsDialog")
 
         root_layout = QVBoxLayout(self)
-
-        self.info_label = QLabel(
-            "Controls are detected per monitor over DDC/CI. "
-            "Supported sliders depend on each display model. "
-            "Use Refresh for a deeper capability scan."
-        )
-        self.info_label.setWordWrap(True)
-        root_layout.addWidget(self.info_label)
+        root_layout.setContentsMargins(6, 6, 6, 6)
+        root_layout.setSpacing(6)
 
         toolbar_layout = QHBoxLayout()
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(8)
         self.refresh_button = QPushButton("Refresh Controls (Deep Scan)")
         toolbar_layout.addWidget(self.refresh_button)
         toolbar_layout.addStretch(1)
@@ -274,21 +299,65 @@ class PictureControlsDialog(QDialog):
         self.content_layout = QVBoxLayout(self.content_widget)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(10)
+        self.content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.content_scroll.setWidget(self.content_widget)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        root_layout.addWidget(self.status_label)
-
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        button_box.rejected.connect(self.reject)
-        button_box.accepted.connect(self.accept)
-        root_layout.addWidget(button_box)
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(8)
+        footer_layout.addWidget(self.status_label, stretch=1)
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.reject)
+        footer_layout.addWidget(self.close_button)
+        root_layout.addLayout(footer_layout)
 
         self.refresh_button.clicked.connect(
             lambda _checked=False: self._reload_controls(force_refresh=True)
         )
         self._reload_controls(force_refresh=False)
+
+    def _content_table_height(self) -> int:
+        self.content_layout.activate()
+        self.content_widget.adjustSize()
+        return max(1, self.content_widget.sizeHint().height())
+
+    def _max_dialog_height(self) -> int:
+        available = self._available_geometry()
+        if available is None:
+            return 920
+        return max(320, available.height() - 36)
+
+    def _refresh_dialog_size(self) -> None:
+        self.content_widget.adjustSize()
+        layout = self.layout()
+        if layout is None:
+            return
+        margins = layout.contentsMargins()
+        spacing = max(0, layout.spacing())
+        static_height = (
+            margins.top()
+            + margins.bottom()
+            + self.refresh_button.sizeHint().height()
+            + max(self.status_label.sizeHint().height(), self.close_button.sizeHint().height())
+            + (spacing * 2)
+        )
+        preferred_content = self._content_table_height()
+        max_height = self._max_dialog_height()
+        max_content_height = max(1, max_height - static_height)
+        content_height = min(preferred_content, max_content_height)
+        self.content_scroll.setFixedHeight(content_height)
+        self.content_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if preferred_content <= max_content_height
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        target_width = max(self.minimumWidth(), self.sizeHint().width())
+        self.resize(target_width, static_height + content_height)
+        if self.isVisible():
+            self._position_bottom_right()
 
     def _available_geometry(self):
         screen = self.screen()
@@ -304,17 +373,12 @@ class PictureControlsDialog(QDialog):
         available = self._available_geometry()
         if available is None:
             return
-        frame = self.frameGeometry()
-        target_x = available.right() - frame.width() - POPUP_EDGE_MARGIN_PX + 1
-        target_y = available.bottom() - frame.height() - POPUP_EDGE_MARGIN_PX + 1
-        target_x = max(available.left(), min(target_x, available.right() - frame.width() + 1))
-        target_y = max(available.top(), min(target_y, available.bottom() - frame.height() + 1))
-        self.move(target_x, target_y)
+        self.move(_bottom_right_popup_position(self, available))
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         _apply_native_rounded_corners(self)
-        QTimer.singleShot(0, self._position_bottom_right)
+        QTimer.singleShot(0, self._refresh_dialog_size)
 
     def _clear_content(self) -> None:
         while self.content_layout.count():
@@ -333,7 +397,10 @@ class PictureControlsDialog(QDialog):
         monitor_count_with_controls = 0
         for monitor in self.monitors:
             group = QGroupBox(monitor.name)
+            group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
             group_layout = QVBoxLayout(group)
+            group_layout.setContentsMargins(8, 4, 8, 8)
+            group_layout.setSpacing(8)
 
             try:
                 controls = self.service.list_picture_controls(
@@ -369,7 +436,6 @@ class PictureControlsDialog(QDialog):
 
             self.content_layout.addWidget(group)
 
-        self.content_layout.addStretch(1)
         if monitor_count_with_controls == 0:
             self.status_label.setText(
                 "No picture sliders are available. "
@@ -380,6 +446,7 @@ class PictureControlsDialog(QDialog):
                 f"Loaded picture controls for {monitor_count_with_controls} of "
                 f"{len(self.monitors)} monitor(s)."
             )
+        self._refresh_dialog_size()
 
     def _apply_control_value(
         self,
@@ -408,10 +475,13 @@ class SettingsDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Brightness Tray Settings")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setMinimumWidth(760)
         _apply_rounded_popup_chrome(self, "settingsDialog")
 
         self._source_config = deepcopy(current_config)
+        self._initial_theme = normalize_theme_name(current_config.theme)
+        self._selected_theme = self._initial_theme
         self.updated_config: AppConfig | None = None
         self.monitor_labels = monitor_labels or []
         self.brightness_service = brightness_service
@@ -422,13 +492,40 @@ class SettingsDialog(QDialog):
 
         root_layout = QVBoxLayout(self)
         self.content_scroll = QScrollArea()
+        self.content_scroll.setObjectName("settingsContentScroll")
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         root_layout.addWidget(self.content_scroll, stretch=1)
 
         self.content_widget = QWidget()
+        self.content_widget.setObjectName("settingsContentWidget")
         content_layout = QVBoxLayout(self.content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
+
+        appearance_box = QGroupBox("Appearance")
+        appearance_layout = QHBoxLayout(appearance_box)
+        self.theme_button_group = QButtonGroup(self)
+        self.theme_button_group.setExclusive(True)
+        self.theme_buttons: dict[str, QPushButton] = {}
+        for label, theme_name in (
+            ("Light", THEME_LIGHT),
+            ("Dark", THEME_DARK),
+            ("Gray", THEME_GRAY),
+            ("Sand", THEME_SAND),
+        ):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            self.theme_button_group.addButton(button)
+            self.theme_buttons[theme_name] = button
+            button.toggled.connect(
+                lambda checked, selected_theme=theme_name: self._handle_theme_toggle(
+                    selected_theme,
+                    checked,
+                )
+            )
+            appearance_layout.addWidget(button)
+        appearance_layout.addStretch(1)
+        content_layout.addWidget(appearance_box)
 
         startup_box = QGroupBox("Startup")
         startup_layout = QVBoxLayout(startup_box)
@@ -464,21 +561,9 @@ class SettingsDialog(QDialog):
 
         self.location_status_widget = QWidget()
         self.location_status_widget.setObjectName("scheduleTimeCard")
-        self.location_status_widget.setStyleSheet(
-            """
-            QWidget#scheduleTimeCard {
-                border: 1px solid palette(mid);
-                border-radius: 8px;
-                background-color: palette(button);
-            }
-            QWidget#scheduleTimeCard QLabel {
-                border: none;
-            }
-            """
-        )
         location_status_layout = QVBoxLayout(self.location_status_widget)
         location_status_layout.setContentsMargins(8, 6, 8, 6)
-        location_status_layout.setSpacing(1)
+        location_status_layout.setSpacing(6)
         self.location_time_label = QLabel("--:--")
         self.location_time_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -523,6 +608,18 @@ class SettingsDialog(QDialog):
             ]
         )
         self.rules_table.verticalHeader().setVisible(False)
+        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.rules_table.setShowGrid(False)
+        self.rules_table.setStyleSheet(
+            """
+            QTableWidget::item:selected {
+                background-color: rgba(59, 130, 246, 28);
+                border-top: 1px solid rgba(59, 130, 246, 120);
+                border-bottom: 1px solid rgba(59, 130, 246, 120);
+            }
+            """
+        )
         self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -542,7 +639,7 @@ class SettingsDialog(QDialog):
             lambda _checked=False: self._apply_default_sunrise_sunset_rules()
         )
         self.load_default_sun_rules_button.setToolTip(
-            "Replace rules with the preset sunrise/sunset ramp profile."
+            "Add the preset sunrise/sunset ramp profile to the end of the list."
         )
         rule_button_layout.addWidget(self.add_rule_button)
         rule_button_layout.addWidget(self.remove_rule_button)
@@ -606,6 +703,7 @@ class SettingsDialog(QDialog):
         dialog.exec()
 
     def _load_from_config(self) -> None:
+        self._set_selected_theme(normalize_theme_name(self._source_config.theme), preview=False)
         self.startup_checkbox.setChecked(self._source_config.startup_enabled)
         self.schedule_enabled_checkbox.setChecked(self._source_config.schedule.enabled)
         self.gradual_checkbox.setChecked(self._source_config.schedule.gradual)
@@ -620,6 +718,7 @@ class SettingsDialog(QDialog):
         rules = self._source_config.schedule.rules or default_schedule_rules()
         for rule in rules:
             self._add_rule_row(rule)
+        self._refresh_default_rules_button_state()
         self._update_schedule_controls_visibility(self.schedule_enabled_checkbox.isChecked())
         self._refresh_dialog_size()
 
@@ -759,7 +858,7 @@ class SettingsDialog(QDialog):
         available = self._available_geometry()
         if available is None:
             return 920
-        return max(360, available.height() - 36)
+        return max(360, available.height() - 12)
 
     def _available_geometry(self):
         screen = self.screen()
@@ -778,7 +877,10 @@ class SettingsDialog(QDialog):
 
         frame = self.frameGeometry()
         max_x = available.right() - frame.width() + 1
-        max_y = available.bottom() - frame.height() + 1
+        max_y = max(
+            available.top(),
+            available.bottom() - frame.height() - POPUP_TASKBAR_CLEARANCE_PX + 1,
+        )
         target_x = min(max(frame.x(), available.left()), max_x)
         target_y = min(max(frame.y(), available.top()), max_y)
         self.move(target_x, target_y)
@@ -788,12 +890,7 @@ class SettingsDialog(QDialog):
         if available is None:
             return
 
-        frame = self.frameGeometry()
-        target_x = available.right() - frame.width() - POPUP_EDGE_MARGIN_PX + 1
-        target_y = available.bottom() - frame.height() - POPUP_EDGE_MARGIN_PX + 1
-        target_x = max(available.left(), min(target_x, available.right() - frame.width() + 1))
-        target_y = max(available.top(), min(target_y, available.bottom() - frame.height() + 1))
-        self.move(target_x, target_y)
+        self.move(_bottom_right_popup_position(self, available))
 
     def _refresh_dialog_size(self) -> None:
         table_height = self._rules_table_content_height()
@@ -854,12 +951,79 @@ class SettingsDialog(QDialog):
         ]
 
     def _apply_default_sunrise_sunset_rules(self) -> None:
-        self.rules_table.setRowCount(0)
         for rule in self._default_sunrise_sunset_ramp_rules():
             self._add_rule_row(rule)
         self.schedule_enabled_checkbox.setChecked(True)
         self.gradual_checkbox.setChecked(True)
+        self._refresh_default_rules_button_state()
         self._refresh_dialog_size()
+
+    def _rule_from_row(self, row_index: int) -> ScheduleRule | None:
+        target_widget = self.rules_table.cellWidget(row_index, 0)
+        anchor_widget = self.rules_table.cellWidget(row_index, 1)
+        time_widget = self.rules_table.cellWidget(row_index, 2)
+        offset_widget = self.rules_table.cellWidget(row_index, 3)
+        brightness_widget = self.rules_table.cellWidget(row_index, 4)
+        if not isinstance(target_widget, QComboBox):
+            return None
+        if not isinstance(anchor_widget, QComboBox):
+            return None
+        if not isinstance(time_widget, QLineEdit):
+            return None
+        if not isinstance(offset_widget, QSpinBox):
+            return None
+        if not isinstance(brightness_widget, QSpinBox):
+            return None
+
+        target = str(target_widget.currentData() or "").strip().lower()
+        if target not in ("display1", "display2", "both"):
+            target = "both"
+
+        anchor_text = anchor_widget.currentText().strip().lower()
+        if anchor_text == "specific time":
+            return ScheduleRule(
+                anchor="time",
+                offset_minutes=0,
+                brightness=clamp_brightness(brightness_widget.value()),
+                target=target,
+                specific_time=self._normalize_time_text(time_widget.text()),
+            )
+        if anchor_text in ("sunrise", "sunset"):
+            return ScheduleRule(
+                anchor=anchor_text,
+                offset_minutes=int(offset_widget.value()),
+                brightness=clamp_brightness(brightness_widget.value()),
+                target=target,
+                specific_time=None,
+            )
+        return None
+
+    def _rules_match_exact_slice(self, start_index: int, expected_rules: list[ScheduleRule]) -> bool:
+        for offset, expected_rule in enumerate(expected_rules):
+            actual_rule = self._rule_from_row(start_index + offset)
+            if actual_rule is None or actual_rule != expected_rule:
+                return False
+        return True
+
+    def _has_untouched_default_sunrise_sunset_block(self) -> bool:
+        expected_rules = self._default_sunrise_sunset_ramp_rules()
+        expected_count = len(expected_rules)
+        row_count = self.rules_table.rowCount()
+        if row_count < expected_count:
+            return False
+
+        for start_index in range(0, row_count - expected_count + 1):
+            if self._rules_match_exact_slice(start_index, expected_rules):
+                return True
+        return False
+
+    def _refresh_default_rules_button_state(self) -> None:
+        has_untouched_default_block = self._has_untouched_default_sunrise_sunset_block()
+        self.load_default_sun_rules_button.setVisible(not has_untouched_default_block)
+        self.load_default_sun_rules_button.setText("Add Default Sunrise/Sunset Rules to List")
+        self.load_default_sun_rules_button.setToolTip(
+            "Add the preset sunrise/sunset ramp profile to the end of the list."
+        )
 
     def _add_rule_row(self, rule: ScheduleRule) -> None:
         row_index = self.rules_table.rowCount()
@@ -901,7 +1065,19 @@ class SettingsDialog(QDialog):
         anchor_combo.currentTextChanged.connect(
             lambda _text: self._sync_rule_anchor_mode(anchor_combo, time_edit, offset_spin)
         )
+        target_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_default_rules_button_state()
+        )
+        anchor_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_default_rules_button_state()
+        )
+        time_edit.textChanged.connect(lambda _text: self._refresh_default_rules_button_state())
+        offset_spin.valueChanged.connect(lambda _value: self._refresh_default_rules_button_state())
+        brightness_spin.valueChanged.connect(
+            lambda _value: self._refresh_default_rules_button_state()
+        )
         self._sync_rule_anchor_mode(anchor_combo, time_edit, offset_spin)
+        self._refresh_default_rules_button_state()
 
     def _sync_rule_anchor_mode(
         self, anchor_combo: QComboBox, time_edit: QLineEdit, offset_spin: QSpinBox
@@ -923,6 +1099,7 @@ class SettingsDialog(QDialog):
         if current_row < 0:
             return
         self.rules_table.removeRow(current_row)
+        self._refresh_default_rules_button_state()
         self._refresh_dialog_size()
 
     @staticmethod
@@ -1011,6 +1188,7 @@ class SettingsDialog(QDialog):
             return
 
         updated = deepcopy(self._source_config)
+        updated.theme = self._selected_theme
         updated.startup_enabled = self.startup_checkbox.isChecked()
         updated.schedule.enabled = self.schedule_enabled_checkbox.isChecked()
         updated.schedule.gradual = self.gradual_checkbox.isChecked()
@@ -1022,6 +1200,32 @@ class SettingsDialog(QDialog):
 
         self.updated_config = updated
         self.accept()
+
+    def _handle_theme_toggle(self, theme_name: str, checked: bool) -> None:
+        if not checked:
+            return
+        self._set_selected_theme(theme_name, preview=True)
+
+    def _set_selected_theme(self, theme_name: str, preview: bool) -> None:
+        normalized_theme = normalize_theme_name(theme_name)
+        self._selected_theme = normalized_theme
+        for option_theme, button in self.theme_buttons.items():
+            should_check = option_theme == normalized_theme
+            if button.isChecked() == should_check:
+                continue
+            button.blockSignals(True)
+            button.setChecked(should_check)
+            button.blockSignals(False)
+        if preview:
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(build_stylesheet(normalized_theme))
+
+    def reject(self) -> None:  # type: ignore[override]
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(self._initial_theme))
+        super().reject()
 
 
 class BrightnessControlWindow(QWidget):
@@ -1107,9 +1311,11 @@ class BrightnessControlWindow(QWidget):
         self.monitors_group = QGroupBox("Per-Monitor Brightness")
         monitors_layout = QVBoxLayout(self.monitors_group)
         self.monitor_scroll = QScrollArea()
+        self.monitor_scroll.setObjectName("monitorScroll")
         self.monitor_scroll.setWidgetResizable(True)
         self.monitor_scroll.setMinimumHeight(1)
         self.monitor_scroll_content = QWidget()
+        self.monitor_scroll_content.setObjectName("monitorScrollContent")
         self.monitor_rows_layout = QVBoxLayout(self.monitor_scroll_content)
         self.monitor_rows_layout.setContentsMargins(0, 0, 0, 0)
         self.monitor_rows_layout.setSpacing(8)
@@ -1133,6 +1339,7 @@ class BrightnessControlWindow(QWidget):
         self.ambient_button.setChecked(self.config.ambient_auto_enabled)
         self._internal_ui_update = False
         self._update_link_mode_ui()
+        self._refresh_toolbar_icons()
         self.refresh_monitors(apply_saved=True)
         self._set_ambient_enabled(self.config.ambient_auto_enabled, persist=False)
 
@@ -1195,16 +1402,14 @@ class BrightnessControlWindow(QWidget):
             or self.screen()
             or QGuiApplication.primaryScreen()
         )
-        margin = POPUP_EDGE_MARGIN_PX
         target_x = anchor.x()
         target_y = anchor.y()
 
         if screen is not None:
             available = screen.availableGeometry()
-            target_x = available.right() - self.width() - margin + 1
-            target_y = available.bottom() - self.height() - margin + 1
-            target_x = max(available.left(), min(target_x, available.right() - self.width() + 1))
-            target_y = max(available.top(), min(target_y, available.bottom() - self.height() + 1))
+            target = _bottom_right_popup_position(self, available)
+            target_x = target.x()
+            target_y = target.y()
 
         self.move(target_x, target_y)
 
@@ -1330,19 +1535,46 @@ class BrightnessControlWindow(QWidget):
 
     def _load_refresh_icon(self) -> QIcon:
         if REFRESH_ICON_PATH is not None:
-            return QIcon(str(REFRESH_ICON_PATH))
+            source = QPixmap(str(REFRESH_ICON_PATH))
+            if source.isNull():
+                return QIcon(str(REFRESH_ICON_PATH))
+            if normalize_theme_name(self.config.theme) == THEME_DARK:
+                tinted = QPixmap(source.size())
+                tinted.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(tinted)
+                painter.drawPixmap(0, 0, source)
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+                painter.fillRect(tinted.rect(), QColor(255, 255, 255))
+                painter.end()
+                return QIcon(tinted)
+            return QIcon(source)
         return self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
 
     def _build_settings_icon(self) -> QIcon:
         if SETTINGS_ICON_PATH is not None:
-            return QIcon(str(SETTINGS_ICON_PATH))
+            source = QPixmap(str(SETTINGS_ICON_PATH))
+            if source.isNull():
+                return QIcon(str(SETTINGS_ICON_PATH))
+            if normalize_theme_name(self.config.theme) == THEME_DARK:
+                tinted = QPixmap(source.size())
+                tinted.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(tinted)
+                painter.drawPixmap(0, 0, source)
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+                painter.fillRect(tinted.rect(), QColor(255, 255, 255))
+                painter.end()
+                return QIcon(tinted)
+            return QIcon(source)
 
         size = 18
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
 
-        palette = self.palette()
-        bar_color = QColor(palette.buttonText().color())
+        if normalize_theme_name(self.config.theme) == THEME_DARK:
+            bar_color = QColor(255, 255, 255)
+        else:
+            palette = self.palette()
+            bar_color = QColor(palette.buttonText().color())
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1367,6 +1599,10 @@ class BrightnessControlWindow(QWidget):
 
         painter.end()
         return QIcon(pixmap)
+
+    def _refresh_toolbar_icons(self) -> None:
+        self.refresh_button.setIcon(self._load_refresh_icon())
+        self.settings_button.setIcon(self._build_settings_icon())
 
     def _handle_refresh_button(self) -> None:
         self.refresh_monitors(apply_saved=False)
@@ -1600,6 +1836,7 @@ class BrightnessControlWindow(QWidget):
             return
 
         self.config = dialog.updated_config
+        self._refresh_toolbar_icons()
         self._set_global_slider_value(self.config.last_global_brightness)
         self.set_link_mode(
             self.config.link_mode,
