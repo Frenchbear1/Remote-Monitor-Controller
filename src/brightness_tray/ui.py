@@ -1393,7 +1393,8 @@ class BrightnessControlWindow(QWidget):
         self.adjustSize()
         preferred_size = self.sizeHint()
         width = max(420, min(560, preferred_size.width()))
-        min_height = 118 if self.config.link_mode else 160
+        compact_layout = self._is_link_mode_effective() or len(self.monitor_rows) <= 1
+        min_height = 118 if compact_layout else 160
         height = max(min_height, min(640, preferred_size.height()))
         self.resize(width, height)
 
@@ -1777,7 +1778,9 @@ class BrightnessControlWindow(QWidget):
         self._internal_ui_update = False
 
     def _update_link_mode_ui(self) -> None:
-        linked = self.config.link_mode
+        link_toggle_visible = len(self.monitor_rows) > 1
+        linked = self._is_link_mode_effective()
+        self.link_button.setVisible(link_toggle_visible)
         self.link_button.setText("Linked" if linked else "Unlinked")
         self.combined_group.setVisible(linked)
         self.monitors_group.setVisible(not linked)
@@ -1803,17 +1806,31 @@ class BrightnessControlWindow(QWidget):
         self._sync_monitor_scroll_height()
 
     def _sync_monitor_scroll_height(self) -> None:
-        if self.config.link_mode:
-            self.monitor_scroll.setFixedHeight(56)
+        if self._is_link_mode_effective():
+            self.monitor_scroll.setFixedHeight(1)
+            self.monitor_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             return
         if not self.monitor_rows:
-            self.monitor_scroll.setFixedHeight(56)
+            self.monitor_scroll.setFixedHeight(1)
+            self.monitor_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             return
         spacing = self.monitor_rows_layout.spacing()
-        content_height = sum(row.sizeHint().height() for row in self.monitor_rows)
+        margins = self.monitor_rows_layout.contentsMargins()
+        content_height = margins.top() + margins.bottom()
+        content_height += sum(row.sizeHint().height() for row in self.monitor_rows)
         content_height += max(0, len(self.monitor_rows) - 1) * spacing
-        content_height += 8
-        self.monitor_scroll.setFixedHeight(max(56, min(420, content_height)))
+        content_height += self.monitor_scroll.frameWidth() * 2
+        max_height = 420
+        needs_scroll = content_height > max_height
+        self.monitor_scroll.setFixedHeight(max(1, min(max_height, content_height)))
+        self.monitor_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if needs_scroll
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+    def _is_link_mode_effective(self) -> bool:
+        return bool(self.config.link_mode) and len(self.monitor_rows) > 1
 
     def _refresh_visible_popup_geometry(self) -> None:
         if not self.isVisible():
