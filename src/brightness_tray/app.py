@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 
@@ -21,6 +22,9 @@ from .startup import set_startup_enabled
 from .sun_schedule import SunScheduleEngine
 from .themes import build_stylesheet, normalize_theme_name
 from .ui import BrightnessControlWindow
+
+
+APP_DISPLAY_NAME = os.getenv("BRIGHTNESS_TRAY_NAME", "Brightness Tray")
 
 
 class TrayController(QObject):
@@ -45,7 +49,7 @@ class TrayController(QObject):
 
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-        self.tray_icon.setToolTip("Brightness Tray")
+        self.tray_icon.setToolTip(APP_DISPLAY_NAME)
         self.tray_icon.setContextMenu(self._build_menu())
         self.tray_icon.activated.connect(self._handle_tray_activation)
         self.tray_icon.show()
@@ -162,12 +166,20 @@ class TrayController(QObject):
 
     def _rules_for_display_index(self, display_index: int) -> list[ScheduleRule]:
         if display_index == 0:
-            allowed_targets = {"display1", "both"}
+            display_target = "display1"
         elif display_index == 1:
-            allowed_targets = {"display2", "both"}
+            display_target = "display2"
         else:
-            allowed_targets = {"both"}
-        return [rule for rule in self.config.schedule.rules if rule.target in allowed_targets]
+            display_target = ""
+
+        if display_target:
+            specific_rules = [
+                rule for rule in self.config.schedule.rules if rule.target == display_target
+            ]
+            if specific_rules:
+                return specific_rules
+
+        return [rule for rule in self.config.schedule.rules if rule.target == "both"]
 
     def _calculate_schedule_targets(self) -> dict[str, int]:
         targets: dict[str, int] = {}
@@ -257,7 +269,7 @@ class TrayController(QObject):
 
 def run() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("Brightness Tray")
+    app.setApplicationName(APP_DISPLAY_NAME)
     app.setQuitOnLastWindowClosed(False)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():

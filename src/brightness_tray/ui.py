@@ -8,19 +8,22 @@ import sys
 import time as wall_time
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QPoint, QPointF, QRegularExpression, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QRegularExpression, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QCursor,
+    QFont,
     QGuiApplication,
     QIcon,
+    QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -30,7 +33,6 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -40,7 +42,6 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStyle,
-    QTableWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -90,6 +91,99 @@ REFRESH_ICON_PATH = _resolve_icon_path("refresh.png")
 SETTINGS_ICON_PATH = _resolve_icon_path("settings.png")
 POPUP_EDGE_MARGIN_PX = 10
 POPUP_TASKBAR_CLEARANCE_PX = 8
+
+
+def _format_time_from_minutes(minutes: int | float) -> str:
+    bounded_minutes = int(round(float(minutes))) % 1440
+    return f"{bounded_minutes // 60:02d}:{bounded_minutes % 60:02d}"
+
+
+def _parse_time_to_minutes(value: str | None) -> int | None:
+    text = str(value or "").strip()
+    if ":" not in text:
+        return None
+    parts = text.split(":", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _round_to_step(value: float, step: int) -> int:
+    if step <= 0:
+        return int(round(value))
+    return int(round(value / step) * step)
+
+
+def _mix_channel(start: int, end: int, ratio: float) -> int:
+    return max(0, min(255, int(round(start + (end - start) * ratio))))
+
+
+def _mix_color(start: QColor, end: QColor, ratio: float) -> QColor:
+    bounded = max(0.0, min(1.0, ratio))
+    return QColor(
+        _mix_channel(start.red(), end.red(), bounded),
+        _mix_channel(start.green(), end.green(), bounded),
+        _mix_channel(start.blue(), end.blue(), bounded),
+    )
+
+
+def _brightness_handle_color(value: int | float) -> QColor:
+    ratio = max(0.0, min(1.0, float(value) / 100.0))
+    if ratio < 0.45:
+        return _mix_color(QColor("#64748b"), QColor("#38bdf8"), ratio / 0.45)
+    return _mix_color(QColor("#38bdf8"), QColor("#60a5fa"), (ratio - 0.45) / 0.55)
+
+
+def _brightness_slider_stylesheet(value: int | float) -> str:
+    handle = _brightness_handle_color(value).name()
+    return f"""
+    QSlider::groove:horizontal {{
+        height: 10px;
+        border-radius: 5px;
+        border: 1px solid rgba(148, 163, 184, 92);
+        background: qlineargradient(
+            x1: 0, y1: 0, x2: 1, y2: 0,
+            stop: 0 #334155,
+            stop: 0.45 #38bdf8,
+            stop: 1 #60a5fa
+        );
+    }}
+    QSlider::sub-page:horizontal {{
+        border-radius: 5px;
+        background: transparent;
+    }}
+    QSlider::add-page:horizontal {{
+        border-radius: 5px;
+        background: transparent;
+    }}
+    QSlider::handle:horizontal {{
+        width: 20px;
+        height: 20px;
+        margin: -7px 0;
+        border-radius: 10px;
+        background: {handle};
+        border: 2px solid rgba(255, 255, 255, 215);
+    }}
+    QSlider::handle:horizontal:hover {{
+        border: 2px solid rgba(255, 255, 255, 245);
+    }}
+    """
+
+
+def _apply_brightness_slider_style(slider: QSlider, value: int | float) -> None:
+    slider.setStyleSheet(_brightness_slider_stylesheet(value))
+
+
+def _brightness_value_label_style(value: int | float) -> str:
+    color = _brightness_handle_color(value).name()
+    return f"font-weight: 600; color: {color};"
 
 
 def _bottom_right_popup_position(widget: QWidget, available) -> QPoint:
@@ -159,11 +253,13 @@ class MonitorSliderRow(QWidget):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 100)
         self.slider.setValue(clamp_brightness(initial_value))
+        _apply_brightness_slider_style(self.slider, self.slider.value())
         layout.addWidget(self.slider, stretch=1)
 
         self.value_label = QLabel(f"{self.slider.value()}%")
         self.value_label.setMinimumWidth(40)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.value_label.setStyleSheet(_brightness_value_label_style(self.slider.value()))
         layout.addWidget(self.value_label)
 
         self.slider.valueChanged.connect(self._handle_slider_change)
@@ -173,11 +269,15 @@ class MonitorSliderRow(QWidget):
         self.slider.blockSignals(True)
         self.slider.setValue(bounded)
         self.slider.blockSignals(False)
+        _apply_brightness_slider_style(self.slider, bounded)
         self.value_label.setText(f"{bounded}%")
+        self.value_label.setStyleSheet(_brightness_value_label_style(bounded))
 
     def _handle_slider_change(self, value: int) -> None:
         bounded = clamp_brightness(value)
+        _apply_brightness_slider_style(self.slider, bounded)
         self.value_label.setText(f"{bounded}%")
+        self.value_label.setStyleSheet(_brightness_value_label_style(bounded))
         self.brightness_changed.emit(self.monitor.key, bounded)
 
 
@@ -464,6 +564,701 @@ class PictureControlsDialog(QDialog):
         )
 
 
+class ScheduleGraphWidget(QWidget):
+    edit_started = Signal()
+    rules_changed = Signal(object)
+    selection_changed = Signal(int)
+
+    _LEFT_MARGIN = 54
+    _RIGHT_MARGIN = 18
+    _TOP_MARGIN = 34
+    _BOTTOM_MARGIN = 38
+    _HIT_RADIUS = 12
+    _DRAG_MINUTE_STEP = 5
+
+    def __init__(
+        self,
+        target_choices: list[tuple[str, str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(290)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setToolTip("Double-click the graph to add a point. Drag points to change time and brightness.")
+
+        self._rules: list[ScheduleRule] = []
+        self._target_labels = {value: label for value, label in target_choices}
+        self._selected_index = -1
+        self._drag_index: int | None = None
+        self._drag_edit_started = False
+        self._hover_index = -1
+        self._sunrise_minutes: int | None = None
+        self._sunset_minutes: int | None = None
+        self._now_minutes: float | None = None
+        self._gradual = True
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(720, 300)
+
+    def set_rules(self, rules: list[ScheduleRule], selected_index: int | None = None) -> None:
+        self._rules = [deepcopy(rule) for rule in rules]
+        if selected_index is None:
+            selected_index = self._selected_index
+        if selected_index < 0 or selected_index >= len(self._rules):
+            selected_index = 0 if self._rules else -1
+        selection_changed = selected_index != self._selected_index
+        self._selected_index = selected_index
+        self.update()
+        if selection_changed:
+            self.selection_changed.emit(self._selected_index)
+
+    def rules(self) -> list[ScheduleRule]:
+        return [deepcopy(rule) for rule in self._rules]
+
+    def selected_index(self) -> int:
+        return self._selected_index
+
+    def set_selected_index(self, index: int) -> None:
+        if index < 0 or index >= len(self._rules):
+            index = -1
+        if index == self._selected_index:
+            return
+        self._selected_index = index
+        self.selection_changed.emit(index)
+        self.update()
+
+    def set_sun_times(self, sunrise_time: datetime | None, sunset_time: datetime | None) -> None:
+        self._sunrise_minutes = self._datetime_to_minutes(sunrise_time)
+        self._sunset_minutes = self._datetime_to_minutes(sunset_time)
+        self.update()
+
+    def set_current_time(self, current_time: datetime | None) -> None:
+        if current_time is None:
+            self._now_minutes = None
+        else:
+            self._now_minutes = (
+                current_time.hour * 60
+                + current_time.minute
+                + current_time.second / 60.0
+            )
+        self.update()
+
+    def set_gradual(self, gradual: bool) -> None:
+        if self._gradual == gradual:
+            return
+        self._gradual = gradual
+        self.update()
+
+    @staticmethod
+    def _datetime_to_minutes(value: datetime | None) -> int | None:
+        if value is None:
+            return None
+        return value.hour * 60 + value.minute
+
+    @staticmethod
+    def _target_short_label(target: str) -> str:
+        if target == "display1":
+            return "D1"
+        if target == "display2":
+            return "D2"
+        return "Both"
+
+    @staticmethod
+    def _target_dot_label(target: str) -> str:
+        if target == "display1":
+            return "D1"
+        if target == "display2":
+            return "D2"
+        return "B"
+
+    @staticmethod
+    def _target_color(target: str) -> QColor:
+        if target == "display1":
+            return QColor("#2f80ed")
+        if target == "display2":
+            return QColor("#22c55e")
+        return QColor("#f59e0b")
+
+    def _panel_text_color(self) -> QColor:
+        panel_color = QColor(self.palette().window().color())
+        if panel_color.lightness() < 120:
+            return QColor("#e5e7eb")
+        return QColor("#475569")
+
+    def _plot_rect(self) -> QRectF:
+        return QRectF(
+            self._LEFT_MARGIN,
+            self._TOP_MARGIN,
+            max(120, self.width() - self._LEFT_MARGIN - self._RIGHT_MARGIN),
+            max(120, self.height() - self._TOP_MARGIN - self._BOTTOM_MARGIN),
+        )
+
+    def _effective_sunrise_minutes(self) -> int:
+        return self._sunrise_minutes if self._sunrise_minutes is not None else 6 * 60
+
+    def _effective_sunset_minutes(self) -> int:
+        return self._sunset_minutes if self._sunset_minutes is not None else 18 * 60
+
+    def _base_anchor_minutes(self, anchor: str) -> int:
+        if anchor == "sunset":
+            return self._effective_sunset_minutes()
+        return self._effective_sunrise_minutes()
+
+    def _rule_minutes(self, rule: ScheduleRule) -> int:
+        if rule.anchor == "time":
+            parsed = _parse_time_to_minutes(rule.specific_time)
+            return parsed if parsed is not None else 12 * 60
+        return self._base_anchor_minutes(rule.anchor) + int(rule.offset_minutes)
+
+    def clock_minutes_for_rule(self, rule: ScheduleRule) -> int:
+        return self._rule_minutes(rule) % 1440
+
+    def offset_for_anchor_time(
+        self,
+        anchor: str,
+        clock_minutes: int,
+        previous_offset: int = 0,
+    ) -> int:
+        anchor_minutes = self._base_anchor_minutes(anchor)
+        return self._offset_for_drag(anchor_minutes, clock_minutes, previous_offset)
+
+    def _x_from_minutes(self, minutes: int | float, plot: QRectF) -> float:
+        bounded = float(minutes) % 1440.0
+        return plot.left() + (bounded / 1440.0) * plot.width()
+
+    def _minutes_from_x(self, x_pos: float, plot: QRectF) -> int:
+        ratio = (x_pos - plot.left()) / max(1.0, plot.width())
+        minutes = max(0.0, min(1439.0, ratio * 1440.0))
+        return max(0, min(1439, _round_to_step(minutes, self._DRAG_MINUTE_STEP)))
+
+    def _y_from_brightness(self, brightness: int | float, plot: QRectF) -> float:
+        bounded = max(0.0, min(100.0, float(brightness)))
+        return plot.top() + ((100.0 - bounded) / 100.0) * plot.height()
+
+    def _brightness_from_y(self, y_pos: float, plot: QRectF) -> int:
+        ratio = (y_pos - plot.top()) / max(1.0, plot.height())
+        brightness = 100.0 - max(0.0, min(1.0, ratio)) * 100.0
+        return clamp_brightness(brightness)
+
+    def _point_positions(self, plot: QRectF) -> list[tuple[int, QPointF, ScheduleRule]]:
+        points: list[tuple[int, QPointF, ScheduleRule]] = []
+        for index, rule in enumerate(self._rules):
+            points.append(
+                (
+                    index,
+                    QPointF(
+                        self._x_from_minutes(self._rule_minutes(rule), plot),
+                        self._y_from_brightness(rule.brightness, plot),
+                    ),
+                    rule,
+                )
+            )
+        return points
+
+    def _hit_test(self, pos: QPointF) -> int:
+        plot = self._plot_rect()
+        best_index = -1
+        best_distance = float(self._HIT_RADIUS)
+        for index, point, _rule in self._point_positions(plot):
+            distance = math.hypot(point.x() - pos.x(), point.y() - pos.y())
+            if distance <= best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def _event_position(self, event) -> QPointF:
+        if hasattr(event, "position"):
+            return QPointF(event.position())
+        return QPointF(event.pos())
+
+    def _offset_for_drag(self, anchor_minutes: int, plotted_minutes: int, previous_offset: int) -> int:
+        base_offset = plotted_minutes - anchor_minutes
+        candidates = [base_offset - 1440, base_offset, base_offset + 1440]
+        closest = min(candidates, key=lambda value: abs(value - previous_offset))
+        return max(-1440, min(1440, _round_to_step(float(closest), self._DRAG_MINUTE_STEP)))
+
+    def _update_rule_from_position(self, index: int, pos: QPointF) -> None:
+        if index < 0 or index >= len(self._rules):
+            return
+        plot = self._plot_rect()
+        minutes = self._minutes_from_x(pos.x(), plot)
+        brightness = self._brightness_from_y(pos.y(), plot)
+        rule = deepcopy(self._rules[index])
+        if (
+            self._drag_index is not None
+            and not self._drag_edit_started
+            and (
+                rule.brightness != brightness
+                or self._rule_minutes(rule) % 1440 != minutes
+            )
+        ):
+            self._drag_edit_started = True
+            self.edit_started.emit()
+        rule.brightness = brightness
+
+        if rule.anchor == "time":
+            rule.offset_minutes = 0
+            rule.specific_time = _format_time_from_minutes(minutes)
+        else:
+            anchor_minutes = self._base_anchor_minutes(rule.anchor)
+            rule.offset_minutes = self._offset_for_drag(
+                anchor_minutes,
+                minutes,
+                int(rule.offset_minutes),
+            )
+            rule.specific_time = None
+
+        self._rules[index] = rule
+        self.rules_changed.emit(self.rules())
+        self.update()
+
+    def _add_rule_at_position(self, pos: QPointF) -> None:
+        plot = self._plot_rect()
+        if not plot.contains(pos):
+            return
+        self.edit_started.emit()
+        target = "both"
+        if 0 <= self._selected_index < len(self._rules):
+            target = self._rules[self._selected_index].target
+        minutes = self._minutes_from_x(pos.x(), plot)
+        brightness = self._brightness_from_y(pos.y(), plot)
+        self._rules.append(
+            ScheduleRule(
+                anchor="time",
+                offset_minutes=0,
+                brightness=brightness,
+                target=target,
+                specific_time=_format_time_from_minutes(minutes),
+            )
+        )
+        self._selected_index = len(self._rules) - 1
+        self.rules_changed.emit(self.rules())
+        self.selection_changed.emit(self._selected_index)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        index = self._hit_test(self._event_position(event))
+        if index < 0:
+            super().mousePressEvent(event)
+            return
+        self._drag_index = index
+        self._drag_edit_started = False
+        self.set_selected_index(index)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        pos = self._event_position(event)
+        if (
+            self._drag_index is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self._update_rule_from_position(self._drag_index, pos)
+            return
+
+        hover_index = self._hit_test(pos)
+        if hover_index != self._hover_index:
+            self._hover_index = hover_index
+            if hover_index >= 0:
+                self.setToolTip(self._summary_for_rule(hover_index))
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setToolTip(
+                    "Double-click the graph to add a point. Drag points to change time and brightness."
+                )
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_index = None
+        self._drag_edit_started = False
+        if self._hover_index >= 0:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._add_rule_at_position(self._event_position(event))
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._hover_index = -1
+        if self._drag_index is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def _points_for_target_values(self, target_values: set[str]) -> list[tuple[int, int]]:
+        points: list[tuple[int, int]] = []
+        for rule in self._rules:
+            if rule.target not in target_values:
+                continue
+            points.append((self._rule_minutes(rule) % 1440, clamp_brightness(rule.brightness)))
+        points.sort(key=lambda point: point[0])
+        return points
+
+    def _points_for_display_curve(self, target: str) -> list[tuple[int, int]]:
+        specific_points = self._points_for_target_values({target})
+        if specific_points:
+            return specific_points
+        return self._points_for_target_values({"both"})
+
+    def _value_for_minute(self, points: list[tuple[int, int]], minute: float) -> float | None:
+        if not points:
+            return None
+        if len(points) == 1:
+            return float(clamp_brightness(points[0][1]))
+
+        target_minute = float(minute) % 1440.0
+        previous = points[-1]
+        following = points[0]
+        for point in points:
+            if point[0] <= target_minute:
+                previous = point
+                continue
+            following = point
+            break
+
+        if not self._gradual:
+            return float(clamp_brightness(previous[1]))
+
+        start_minute = float(previous[0])
+        end_minute = float(following[0])
+        adjusted_target = target_minute
+        if end_minute <= start_minute:
+            end_minute += 1440.0
+        if adjusted_target < start_minute:
+            adjusted_target += 1440.0
+        duration = end_minute - start_minute
+        if duration <= 0:
+            return float(clamp_brightness(following[1]))
+        ratio = max(0.0, min(1.0, (adjusted_target - start_minute) / duration))
+        return previous[1] + (following[1] - previous[1]) * ratio
+
+    def _draw_sky(self, painter: QPainter, plot: QRectF) -> None:
+        sunrise = self._effective_sunrise_minutes()
+        sunset = self._effective_sunset_minutes()
+        painter.save()
+        painter.setClipRect(plot)
+
+        sky_gradient = QLinearGradient(plot.left(), 0, plot.right(), 0)
+        stops: list[tuple[float, QColor]] = [(0.0, QColor("#0f172a")), (1.0, QColor("#0f172a"))]
+
+        def add_stop(minutes: int | float, color: str) -> None:
+            if minutes < 0 or minutes > 1440:
+                return
+            stops.append((float(minutes) / 1440.0, QColor(color)))
+
+        if sunset > sunrise:
+            midday = sunrise + (sunset - sunrise) / 2.0
+            add_stop(sunrise - 210, "#0f172a")
+            add_stop(sunrise - 135, "#1e3a8a")
+            add_stop(sunrise - 72, "#fb923c")
+            add_stop(sunrise + 16, "#fde68a")
+            add_stop(sunrise + 125, "#7dd3fc")
+            add_stop(midday, "#bfdbfe")
+            add_stop(sunset - 125, "#7dd3fc")
+            add_stop(sunset - 18, "#fecdd3")
+            add_stop(sunset + 78, "#be123c")
+            add_stop(sunset + 155, "#0f172a")
+        else:
+            add_stop(360, "#f97316")
+            add_stop(420, "#7dd3fc")
+            add_stop(720, "#bfdbfe")
+            add_stop(1080, "#fb7185")
+
+        for position, color in sorted(stops, key=lambda stop: stop[0]):
+            sky_gradient.setColorAt(position, color)
+
+        painter.fillRect(plot, QBrush(sky_gradient))
+
+        painter.restore()
+
+    def _draw_sun_icon(self, painter: QPainter, center: QPointF, color: QColor) -> None:
+        painter.save()
+        painter.setPen(QPen(color, 1))
+        painter.setBrush(QBrush(color))
+        painter.drawEllipse(center, 5, 5)
+        for index in range(8):
+            angle = math.tau * index / 8.0
+            inner = QPointF(center.x() + math.cos(angle) * 8, center.y() + math.sin(angle) * 8)
+            outer = QPointF(center.x() + math.cos(angle) * 11, center.y() + math.sin(angle) * 11)
+            painter.drawLine(inner, outer)
+        painter.restore()
+
+    def _draw_moon_icon(self, painter: QPainter, center: QPointF, mask_color: QColor) -> None:
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#e5e7eb")))
+        painter.drawEllipse(center, 6, 6)
+        painter.setBrush(QBrush(mask_color))
+        painter.drawEllipse(QPointF(center.x() + 4, center.y() - 2), 6, 6)
+        painter.restore()
+
+    def _draw_event_marker(
+        self,
+        painter: QPainter,
+        plot: QRectF,
+        minutes: int,
+        color: QColor,
+        label: str,
+    ) -> None:
+        x_pos = self._x_from_minutes(minutes, plot)
+        line_color = QColor(color)
+        line_color.setAlpha(150)
+        painter.setPen(QPen(line_color, 1))
+        painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
+        self._draw_sun_icon(painter, QPointF(x_pos, plot.top() + 18), color)
+        painter.setPen(QPen(QColor("#f8fafc"), 1))
+        painter.drawText(
+            QRectF(x_pos - 34, plot.top() + 30, 68, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            label,
+        )
+
+    def _draw_axes(self, painter: QPainter, plot: QRectF) -> None:
+        grid_pen = QPen(QColor(255, 255, 255, 70), 1)
+        text_color = self._panel_text_color()
+        small_font = QFont(painter.font())
+        point_size = small_font.pointSizeF()
+        small_font.setPointSizeF(8.0 if point_size <= 0 else max(8.0, point_size * 0.82))
+        painter.setFont(small_font)
+
+        for brightness in (100, 75, 50, 25, 0):
+            y_pos = self._y_from_brightness(brightness, plot)
+            painter.setPen(grid_pen)
+            painter.drawLine(QPointF(plot.left(), y_pos), QPointF(plot.right(), y_pos))
+            painter.setPen(QPen(text_color, 1))
+            painter.drawText(
+                QRectF(4, y_pos - 9, self._LEFT_MARGIN - 10, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"{brightness}%",
+            )
+
+        for minutes, label in (
+            (0, "00:00"),
+            (360, "06:00"),
+            (720, "12:00"),
+            (1080, "18:00"),
+            (1440, "24:00"),
+        ):
+            x_pos = plot.right() if minutes == 1440 else self._x_from_minutes(minutes, plot)
+            painter.setPen(QPen(QColor(255, 255, 255, 55), 1))
+            painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
+            painter.setPen(QPen(text_color, 1))
+            painter.drawText(
+                QRectF(x_pos - 28, plot.bottom() + 8, 56, 18),
+                Qt.AlignmentFlag.AlignCenter,
+                label,
+            )
+
+    def _draw_interpolation_path(
+        self,
+        painter: QPainter,
+        plot: QRectF,
+        allowed_targets: set[str],
+        color: QColor,
+    ) -> None:
+        if allowed_targets == {"both", "display1"}:
+            points = self._points_for_display_curve("display1")
+        elif allowed_targets == {"both", "display2"}:
+            points = self._points_for_display_curve("display2")
+        else:
+            points = self._points_for_target_values(allowed_targets)
+        if not points:
+            return
+        path = QPainterPath()
+        sample_count = 180
+        first = True
+        for sample_index in range(sample_count + 1):
+            minutes = (1440.0 / sample_count) * sample_index
+            value = self._value_for_minute(points, minutes)
+            if value is None:
+                continue
+            point = QPointF(
+                self._x_from_minutes(min(minutes, 1439.0), plot),
+                self._y_from_brightness(value, plot),
+            )
+            if first:
+                path.moveTo(point)
+                first = False
+            else:
+                path.lineTo(point)
+        path_color = QColor(color)
+        path_color.setAlpha(210)
+        painter.setPen(QPen(path_color, 3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+    def _draw_now_marker(self, painter: QPainter, plot: QRectF) -> None:
+        if self._now_minutes is None:
+            return
+        x_pos = self._x_from_minutes(self._now_minutes, plot)
+        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+        painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
+        painter.drawText(
+            QRectF(x_pos - 24, plot.top() - 2, 48, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            "Now",
+        )
+        for allowed, target in (
+            ({"both", "display1"}, "display1"),
+            ({"both", "display2"}, "display2"),
+        ):
+            if target == "display1":
+                target_points = self._points_for_display_curve("display1")
+            else:
+                target_points = self._points_for_display_curve("display2")
+            value = self._value_for_minute(target_points, self._now_minutes)
+            if value is None:
+                continue
+            color = self._target_color(target)
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(
+                QPointF(x_pos, self._y_from_brightness(value, plot)),
+                5,
+                5,
+            )
+
+    def _draw_points(self, painter: QPainter, plot: QRectF) -> None:
+        points = self._point_positions(plot)
+        points.sort(key=lambda item: item[0] == self._selected_index)
+        for index, point, rule in points:
+            selected = index == self._selected_index
+            color = self._target_color(rule.target)
+            radius = 9 if selected else 7
+            if selected:
+                halo = QColor("#ffffff")
+                halo.setAlpha(90)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(halo))
+                painter.drawEllipse(point, radius + 6, radius + 6)
+
+            painter.setPen(QPen(QColor("#ffffff"), 2 if selected else 1))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(point, radius, radius)
+
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.drawText(
+                QRectF(point.x() - 16, point.y() - 8, 32, 16),
+                Qt.AlignmentFlag.AlignCenter,
+                self._target_dot_label(rule.target),
+            )
+
+        if 0 <= self._selected_index < len(self._rules):
+            self._draw_selected_callout(painter, plot, self._selected_index)
+
+    def _draw_selected_callout(self, painter: QPainter, plot: QRectF, index: int) -> None:
+        rule = self._rules[index]
+        point = next(
+            (point for point_index, point, _rule in self._point_positions(plot) if point_index == index),
+            None,
+        )
+        if point is None:
+            return
+        text = (
+            f"{self._target_short_label(rule.target)} "
+            f"{_format_time_from_minutes(self._rule_minutes(rule))} "
+            f"{clamp_brightness(rule.brightness)}%"
+        )
+        width = min(max(118, painter.fontMetrics().horizontalAdvance(text) + 24), int(plot.width()))
+        height = 24
+        x_pos = min(max(plot.left(), point.x() - width / 2), plot.right() - width)
+        y_pos = point.y() - height - 16
+        if y_pos < plot.top() + 4:
+            y_pos = point.y() + 16
+        rect = QRectF(x_pos, y_pos, width, height)
+        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+        painter.setBrush(QBrush(QColor(17, 24, 39, 210)))
+        painter.drawRoundedRect(rect, 6, 6)
+        painter.setPen(QPen(QColor("#f8fafc"), 1))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_legend(self, painter: QPainter, plot: QRectF) -> None:
+        entries = (("display1", "Display 1"), ("display2", "Display 2"), ("both", "Both"))
+        x_pos = max(plot.left(), plot.right() - 230)
+        y_pos = 8
+        text_color = self._panel_text_color()
+        painter.setPen(QPen(text_color, 1))
+        for target, label in entries:
+            color = self._target_color(target)
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(x_pos, y_pos + 7), 5, 5)
+            painter.setPen(QPen(text_color, 1))
+            painter.drawText(
+                QRectF(x_pos + 10, y_pos - 1, 74, 16),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+            x_pos += 76
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        base_font = QFont("Segoe UI")
+        base_font.setPointSize(8)
+        painter.setFont(base_font)
+
+        outer_rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        panel_color = QColor(self.palette().window().color())
+        if panel_color.lightness() < 90:
+            border_color = QColor(255, 255, 255, 38)
+        else:
+            border_color = QColor(15, 23, 42, 42)
+        painter.setPen(QPen(border_color, 1))
+        painter.setBrush(QBrush(panel_color))
+        painter.drawRoundedRect(outer_rect, 8, 8)
+
+        plot = self._plot_rect()
+        self._draw_sky(painter, plot)
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(plot, 7, 7)
+        self._draw_axes(painter, plot)
+        self._draw_moon_icon(painter, QPointF(plot.left() + 22, plot.top() + 22), QColor("#101827"))
+        self._draw_event_marker(
+            painter,
+            plot,
+            self._effective_sunrise_minutes(),
+            QColor("#fde68a"),
+            "Sunrise",
+        )
+        self._draw_event_marker(
+            painter,
+            plot,
+            self._effective_sunset_minutes(),
+            QColor("#fecdd3"),
+            "Sunset",
+        )
+        self._draw_interpolation_path(painter, plot, {"both", "display1"}, self._target_color("display1"))
+        self._draw_interpolation_path(painter, plot, {"both", "display2"}, self._target_color("display2"))
+        self._draw_now_marker(painter, plot)
+        self._draw_points(painter, plot)
+        self._draw_legend(painter, plot)
+
+    def _summary_for_rule(self, index: int) -> str:
+        if index < 0 or index >= len(self._rules):
+            return ""
+        rule = self._rules[index]
+        display = self._target_labels.get(rule.target, self._target_short_label(rule.target))
+        time_text = _format_time_from_minutes(self._rule_minutes(rule))
+        if rule.anchor == "time":
+            anchor_text = f"Fixed time {time_text}"
+        else:
+            offset = int(rule.offset_minutes)
+            sign = "+" if offset >= 0 else ""
+            anchor_text = f"{rule.anchor.title()} {sign}{offset} min ({time_text})"
+        return f"{display}\n{anchor_text}\nBrightness {clamp_brightness(rule.brightness)}%"
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -489,6 +1284,11 @@ class SettingsDialog(QDialog):
         self._detected_location: LocationContext | None = None
         self._location_timezone_name: str | None = None
         self._sun_times_cache_key: tuple[str, float, float, str] | None = None
+        self._schedule_rules: list[ScheduleRule] = []
+        self._syncing_rule_editor = False
+        self._schedule_undo_enabled = False
+        self._restoring_schedule_undo = False
+        self._schedule_undo_stack: list[tuple[list[ScheduleRule], int, bool, bool]] = []
 
         root_layout = QVBoxLayout(self)
         self.content_scroll = QScrollArea()
@@ -590,59 +1390,75 @@ class SettingsDialog(QDialog):
         )
         schedule_layout.addLayout(schedule_top_layout)
 
-        self.rules_header_label = QLabel(
-            "Rules: choose a display target, then anchor by sunrise/sunset (with offset) "
-            "or use a fixed daily time (HH:MM, 24-hour)."
-        )
-        self.rules_header_label.setWordWrap(True)
-        schedule_layout.addWidget(self.rules_header_label)
+        self.schedule_graph = ScheduleGraphWidget(self._build_target_choices())
+        schedule_layout.addWidget(self.schedule_graph)
 
-        self.rules_table = QTableWidget(0, 5)
-        self.rules_table.setHorizontalHeaderLabels(
-            [
-                "Display Target",
-                "Anchor",
-                "Specific Time (HH:MM)",
-                "Offset (min)",
-                "Brightness (%)",
-            ]
-        )
-        self.rules_table.verticalHeader().setVisible(False)
-        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.rules_table.setShowGrid(False)
-        self.rules_table.setStyleSheet(
-            """
-            QTableWidget::item:selected {
-                background-color: rgba(59, 130, 246, 28);
-                border-top: 1px solid rgba(59, 130, 246, 120);
-                border-bottom: 1px solid rgba(59, 130, 246, 120);
-            }
-            """
-        )
-        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.rules_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        schedule_layout.addWidget(self.rules_table)
+        self.rule_editor_widget = QWidget()
+        rule_editor_layout = QHBoxLayout(self.rule_editor_widget)
+        rule_editor_layout.setContentsMargins(0, 0, 0, 0)
+        rule_editor_layout.setSpacing(8)
+
+        self.selected_rule_label = QLabel("Point")
+        self.selected_rule_label.setMinimumWidth(86)
+        rule_editor_layout.addWidget(self.selected_rule_label)
+
+        self.point_target_combo = QComboBox()
+        for value, label in self._build_target_choices():
+            self.point_target_combo.addItem(label, userData=value)
+        self.point_target_combo.setMinimumWidth(170)
+        rule_editor_layout.addWidget(QLabel("Display"))
+        rule_editor_layout.addWidget(self.point_target_combo)
+
+        self.point_anchor_combo = QComboBox()
+        self.point_anchor_combo.addItems(["sunrise", "sunset", "specific time"])
+        rule_editor_layout.addWidget(QLabel("Anchor"))
+        rule_editor_layout.addWidget(self.point_anchor_combo)
+
+        self.point_time_edit = QLineEdit()
+        self.point_time_edit.setPlaceholderText("HH:MM")
+        time_regex = QRegularExpression(r"^([01]?\d|2[0-3]):[0-5]\d$")
+        self.point_time_edit.setValidator(QRegularExpressionValidator(time_regex, self))
+        self.point_time_edit.setMaximumWidth(74)
+        rule_editor_layout.addWidget(QLabel("Time"))
+        rule_editor_layout.addWidget(self.point_time_edit)
+
+        self.point_offset_spin = QSpinBox()
+        self.point_offset_spin.setRange(-1440, 1440)
+        self.point_offset_spin.setSingleStep(5)
+        self.point_offset_spin.setSuffix(" min")
+        self.point_offset_spin.setMaximumWidth(96)
+        rule_editor_layout.addWidget(QLabel("Offset"))
+        rule_editor_layout.addWidget(self.point_offset_spin)
+
+        self.point_brightness_spin = QSpinBox()
+        self.point_brightness_spin.setRange(0, 100)
+        self.point_brightness_spin.setSuffix("%")
+        self.point_brightness_spin.setMaximumWidth(76)
+        rule_editor_layout.addWidget(QLabel("Brightness"))
+        rule_editor_layout.addWidget(self.point_brightness_spin)
+        rule_editor_layout.addStretch(1)
+        schedule_layout.addWidget(self.rule_editor_widget)
 
         self.rule_buttons_widget = QWidget()
         rule_button_layout = QHBoxLayout(self.rule_buttons_widget)
         rule_button_layout.setContentsMargins(0, 0, 0, 0)
-        self.add_rule_button = QPushButton("Add Rule")
-        self.remove_rule_button = QPushButton("Remove Selected Rule")
-        self.load_default_sun_rules_button = QPushButton("Load Default Sunrise/Sunset Rules")
+        self.add_rule_button = QPushButton("Add Point")
+        self.remove_rule_button = QPushButton("Remove Point")
+        self.undo_schedule_button = QPushButton("Undo")
+        self.undo_schedule_button.setVisible(False)
+        self.load_default_sun_rules_button = QPushButton("Apply Preset Curve")
         self.add_rule_button.clicked.connect(lambda _checked=False: self._add_empty_rule())
         self.remove_rule_button.clicked.connect(lambda _checked=False: self._remove_selected_rule())
+        self.undo_schedule_button.clicked.connect(lambda _checked=False: self._undo_schedule_change())
         self.load_default_sun_rules_button.clicked.connect(
             lambda _checked=False: self._apply_default_sunrise_sunset_rules()
         )
         self.load_default_sun_rules_button.setToolTip(
-            "Add the preset sunrise/sunset ramp profile to the end of the list."
+            "Replace the selected display curve with the original default sunrise/sunset preset."
         )
         rule_button_layout.addWidget(self.add_rule_button)
         rule_button_layout.addWidget(self.remove_rule_button)
+        rule_button_layout.addWidget(self.undo_schedule_button)
         rule_button_layout.addWidget(self.load_default_sun_rules_button)
         rule_button_layout.addStretch(1)
         schedule_layout.addWidget(self.rule_buttons_widget)
@@ -662,7 +1478,27 @@ class SettingsDialog(QDialog):
             lambda _checked=False: self._open_picture_controls_dialog()
         )
         self.schedule_enabled_checkbox.toggled.connect(self._handle_schedule_enabled_toggled)
+        self.gradual_checkbox.toggled.connect(self._handle_gradual_toggled)
+        self.schedule_graph.edit_started.connect(self._remember_schedule_state)
+        self.schedule_graph.rules_changed.connect(self._handle_schedule_graph_rules_changed)
+        self.schedule_graph.selection_changed.connect(self._handle_schedule_graph_selection_changed)
+        self.point_target_combo.currentIndexChanged.connect(
+            lambda _index: self._apply_rule_editor_to_selected()
+        )
+        self.point_anchor_combo.currentTextChanged.connect(
+            lambda _text: self._handle_point_anchor_changed()
+        )
+        self.point_time_edit.textEdited.connect(
+            lambda _text: self._apply_rule_editor_to_selected(time_is_source=True)
+        )
+        self.point_offset_spin.valueChanged.connect(
+            lambda _value: self._handle_point_offset_changed()
+        )
+        self.point_brightness_spin.valueChanged.connect(
+            lambda _value: self._apply_rule_editor_to_selected()
+        )
         self._load_from_config()
+        self._schedule_undo_enabled = True
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1_000)
         self._clock_timer.timeout.connect(self._update_location_time_label)
@@ -713,32 +1549,39 @@ class SettingsDialog(QDialog):
             self.picture_controls_button.setToolTip("Refresh monitors to enable picture controls")
         else:
             self.picture_controls_button.setToolTip("")
-        self._refresh_auto_location(refresh_detection=True)
+        self._refresh_auto_location(refresh_detection=False)
 
         rules = self._source_config.schedule.rules or default_schedule_rules()
-        for rule in rules:
-            self._add_rule_row(rule)
+        self.schedule_graph.set_gradual(self._source_config.schedule.gradual)
+        self._set_schedule_rules(rules, selected_index=0 if rules else -1)
         self._refresh_default_rules_button_state()
         self._update_schedule_controls_visibility(self.schedule_enabled_checkbox.isChecked())
         self._refresh_dialog_size()
 
     def _handle_schedule_enabled_toggled(self, checked: bool) -> None:
+        snapshot = self._schedule_snapshot(schedule_enabled=not checked)
+        self._remember_schedule_state(snapshot)
         self._update_schedule_controls_visibility(checked)
         self._refresh_dialog_size()
         QTimer.singleShot(0, self._refresh_dialog_size)
+
+    def _handle_gradual_toggled(self, checked: bool) -> None:
+        snapshot = self._schedule_snapshot(gradual=not checked)
+        self._remember_schedule_state(snapshot)
+        self.schedule_graph.set_gradual(checked)
 
     def _update_schedule_controls_visibility(self, schedule_enabled: bool) -> None:
         dim_opacity = 1.0 if schedule_enabled else 0.5
         self.gradual_checkbox.setVisible(True)
         self.location_status_widget.setVisible(True)
-        self.rules_header_label.setVisible(True)
-        self.rules_table.setVisible(True)
+        self.schedule_graph.setVisible(True)
+        self.rule_editor_widget.setVisible(True)
         self.rule_buttons_widget.setVisible(True)
         for widget in (
             self.gradual_checkbox,
             self.location_status_widget,
-            self.rules_header_label,
-            self.rules_table,
+            self.schedule_graph,
+            self.rule_editor_widget,
             self.rule_buttons_widget,
         ):
             self._set_widget_opacity(widget, dim_opacity)
@@ -785,6 +1628,7 @@ class SettingsDialog(QDialog):
         if timezone_label:
             time_text = f"{time_text} {timezone_label}"
         self.location_time_label.setText(time_text)
+        self.schedule_graph.set_current_time(current_time)
         self._update_sun_event_labels(current_time, timezone_name)
 
     def _update_sun_event_labels(self, current_time: datetime, timezone_name: str | None) -> None:
@@ -793,6 +1637,7 @@ class SettingsDialog(QDialog):
         if latitude is None or longitude is None:
             self.sunrise_time_label.setText("Sunrise --:--")
             self.sunset_time_label.setText("Sunset --:--")
+            self.schedule_graph.set_sun_times(None, None)
             self._sun_times_cache_key = None
             return
 
@@ -806,6 +1651,7 @@ class SettingsDialog(QDialog):
         if timezone is None:
             self.sunrise_time_label.setText("Sunrise --:--")
             self.sunset_time_label.setText("Sunset --:--")
+            self.schedule_graph.set_sun_times(None, None)
             self._sun_times_cache_key = None
             return
 
@@ -838,21 +1684,15 @@ class SettingsDialog(QDialog):
         sunset_text = sunset_time.strftime("%H:%M") if sunset_time is not None else "--:--"
         self.sunrise_time_label.setText(f"Sunrise {sunrise_text}")
         self.sunset_time_label.setText(f"Sunset {sunset_text}")
+        self.schedule_graph.set_sun_times(sunrise_time, sunset_time)
         self._sun_times_cache_key = cache_key
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         _apply_native_rounded_corners(self)
-        self._refresh_auto_location(refresh_detection=True)
+        self._refresh_auto_location(refresh_detection=False)
         self._position_bottom_right()
         QTimer.singleShot(0, self._refresh_dialog_size)
-
-    def _rules_table_content_height(self) -> int:
-        self.rules_table.resizeRowsToContents()
-        header_height = self.rules_table.horizontalHeader().height()
-        row_heights = sum(self.rules_table.rowHeight(index) for index in range(self.rules_table.rowCount()))
-        frame_height = self.rules_table.frameWidth() * 2
-        return header_height + row_heights + frame_height + 2
 
     def _max_dialog_height(self) -> int:
         available = self._available_geometry()
@@ -893,10 +1733,6 @@ class SettingsDialog(QDialog):
         self.move(_bottom_right_popup_position(self, available))
 
     def _refresh_dialog_size(self) -> None:
-        table_height = self._rules_table_content_height()
-        self.rules_table.setFixedHeight(table_height)
-        self.rules_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
         self.content_widget.adjustSize()
         content_layout = self.content_widget.layout()
         if content_layout is not None:
@@ -933,151 +1769,373 @@ class SettingsDialog(QDialog):
         if self.isVisible():
             self._position_bottom_right()
 
+    def _schedule_snapshot(
+        self,
+        rules: list[ScheduleRule] | None = None,
+        selected_index: int | None = None,
+        schedule_enabled: bool | None = None,
+        gradual: bool | None = None,
+    ) -> tuple[list[ScheduleRule], int, bool, bool]:
+        if rules is None:
+            rules = self._schedule_rules
+        if selected_index is None:
+            selected_index = self.schedule_graph.selected_index()
+        if schedule_enabled is None:
+            schedule_enabled = self.schedule_enabled_checkbox.isChecked()
+        if gradual is None:
+            gradual = self.gradual_checkbox.isChecked()
+        return (
+            [deepcopy(rule) for rule in rules],
+            int(selected_index),
+            bool(schedule_enabled),
+            bool(gradual),
+        )
+
+    @staticmethod
+    def _schedule_snapshots_match(
+        left: tuple[list[ScheduleRule], int, bool, bool],
+        right: tuple[list[ScheduleRule], int, bool, bool],
+    ) -> bool:
+        return (
+            left[0] == right[0]
+            and left[1] == right[1]
+            and left[2] == right[2]
+            and left[3] == right[3]
+        )
+
+    def _remember_schedule_state(
+        self,
+        snapshot: tuple[list[ScheduleRule], int, bool, bool] | None = None,
+    ) -> None:
+        if not self._schedule_undo_enabled or self._restoring_schedule_undo:
+            return
+        current_snapshot = snapshot or self._schedule_snapshot()
+        if self._schedule_undo_stack and self._schedule_snapshots_match(
+            self._schedule_undo_stack[-1],
+            current_snapshot,
+        ):
+            return
+        self._schedule_undo_stack.append(current_snapshot)
+        if len(self._schedule_undo_stack) > 30:
+            self._schedule_undo_stack.pop(0)
+        self.undo_schedule_button.setVisible(True)
+
+    def _undo_schedule_change(self) -> None:
+        if not self._schedule_undo_stack:
+            self.undo_schedule_button.setVisible(False)
+            return
+
+        rules, selected_index, schedule_enabled, gradual = self._schedule_undo_stack.pop()
+        self._restoring_schedule_undo = True
+        try:
+            self.schedule_enabled_checkbox.blockSignals(True)
+            self.gradual_checkbox.blockSignals(True)
+            self.schedule_enabled_checkbox.setChecked(schedule_enabled)
+            self.gradual_checkbox.setChecked(gradual)
+            self.schedule_enabled_checkbox.blockSignals(False)
+            self.gradual_checkbox.blockSignals(False)
+            self.schedule_graph.set_gradual(gradual)
+            self._set_schedule_rules(rules, selected_index=selected_index)
+            self._update_schedule_controls_visibility(schedule_enabled)
+        finally:
+            self.schedule_enabled_checkbox.blockSignals(False)
+            self.gradual_checkbox.blockSignals(False)
+            self._restoring_schedule_undo = False
+
+        self.undo_schedule_button.setVisible(bool(self._schedule_undo_stack))
+        self._refresh_dialog_size()
+
     def _add_empty_rule(self) -> None:
-        self._add_rule_row(ScheduleRule(anchor="sunrise", offset_minutes=0, brightness=100, target="both"))
+        self._remember_schedule_state()
+        selected_index = self.schedule_graph.selected_index()
+        if 0 <= selected_index < len(self._schedule_rules):
+            selected_rule = self._schedule_rules[selected_index]
+            target = selected_rule.target
+            brightness = selected_rule.brightness
+        else:
+            target = "both"
+            brightness = 70
+
+        timezone_name = self._location_timezone_name
+        try:
+            current_time = datetime.now(ZoneInfo(timezone_name)) if timezone_name else datetime.now().astimezone()
+        except Exception:
+            current_time = datetime.now().astimezone()
+        minutes = _round_to_step(current_time.hour * 60 + current_time.minute, 5)
+        new_rule = ScheduleRule(
+            anchor="time",
+            offset_minutes=0,
+            brightness=clamp_brightness(brightness),
+            target=target,
+            specific_time=_format_time_from_minutes(minutes),
+        )
+        updated_rules = [deepcopy(rule) for rule in self._schedule_rules]
+        updated_rules.append(new_rule)
+        self.schedule_enabled_checkbox.setChecked(True)
+        self._set_schedule_rules(updated_rules, selected_index=len(updated_rules) - 1)
         self._refresh_dialog_size()
 
     @staticmethod
-    def _default_sunrise_sunset_ramp_rules() -> list[ScheduleRule]:
+    def _default_sunrise_sunset_ramp_rules(target: str = "both") -> list[ScheduleRule]:
+        if target not in ("display1", "display2", "both"):
+            target = "both"
         return [
-            ScheduleRule(anchor="sunrise", offset_minutes=0, brightness=0, target="both"),
-            ScheduleRule(anchor="sunrise", offset_minutes=15, brightness=10, target="both"),
-            ScheduleRule(anchor="sunrise", offset_minutes=40, brightness=50, target="both"),
-            ScheduleRule(anchor="sunrise", offset_minutes=60, brightness=100, target="both"),
-            ScheduleRule(anchor="sunset", offset_minutes=-40, brightness=100, target="both"),
-            ScheduleRule(anchor="sunset", offset_minutes=-15, brightness=50, target="both"),
-            ScheduleRule(anchor="sunset", offset_minutes=0, brightness=15, target="both"),
-            ScheduleRule(anchor="sunset", offset_minutes=30, brightness=0, target="both"),
+            ScheduleRule(anchor="sunrise", offset_minutes=-60, brightness=50, target=target),
+            ScheduleRule(anchor="sunrise", offset_minutes=-30, brightness=75, target=target),
+            ScheduleRule(anchor="sunrise", offset_minutes=0, brightness=100, target=target),
+            ScheduleRule(anchor="sunset", offset_minutes=0, brightness=100, target=target),
+            ScheduleRule(anchor="sunset", offset_minutes=30, brightness=75, target=target),
+            ScheduleRule(anchor="sunset", offset_minutes=60, brightness=50, target=target),
         ]
 
     def _apply_default_sunrise_sunset_rules(self) -> None:
-        for rule in self._default_sunrise_sunset_ramp_rules():
-            self._add_rule_row(rule)
-        self.schedule_enabled_checkbox.setChecked(True)
-        self.gradual_checkbox.setChecked(True)
-        self._refresh_default_rules_button_state()
-        self._refresh_dialog_size()
-
-    def _rule_from_row(self, row_index: int) -> ScheduleRule | None:
-        target_widget = self.rules_table.cellWidget(row_index, 0)
-        anchor_widget = self.rules_table.cellWidget(row_index, 1)
-        time_widget = self.rules_table.cellWidget(row_index, 2)
-        offset_widget = self.rules_table.cellWidget(row_index, 3)
-        brightness_widget = self.rules_table.cellWidget(row_index, 4)
-        if not isinstance(target_widget, QComboBox):
-            return None
-        if not isinstance(anchor_widget, QComboBox):
-            return None
-        if not isinstance(time_widget, QLineEdit):
-            return None
-        if not isinstance(offset_widget, QSpinBox):
-            return None
-        if not isinstance(brightness_widget, QSpinBox):
-            return None
-
-        target = str(target_widget.currentData() or "").strip().lower()
+        self._remember_schedule_state()
+        selected_index = self.schedule_graph.selected_index()
+        if 0 <= selected_index < len(self._schedule_rules):
+            target = self._schedule_rules[selected_index].target
+        else:
+            target = str(self.point_target_combo.currentData() or "both")
         if target not in ("display1", "display2", "both"):
             target = "both"
 
-        anchor_text = anchor_widget.currentText().strip().lower()
-        if anchor_text == "specific time":
-            return ScheduleRule(
-                anchor="time",
-                offset_minutes=0,
-                brightness=clamp_brightness(brightness_widget.value()),
-                target=target,
-                specific_time=self._normalize_time_text(time_widget.text()),
+        preset_rules = self._default_sunrise_sunset_ramp_rules(target)
+        if target == "both":
+            updated_rules = preset_rules
+        else:
+            updated_rules = [
+                deepcopy(rule)
+                for rule in self._schedule_rules
+                if rule.target not in (target, "both")
+            ]
+            updated_rules.extend(preset_rules)
+        first_new_index = max(0, len(updated_rules) - len(preset_rules))
+        self.schedule_enabled_checkbox.setChecked(True)
+        self.gradual_checkbox.setChecked(True)
+        self.schedule_graph.set_gradual(True)
+        self._set_schedule_rules(updated_rules, selected_index=first_new_index)
+        self._refresh_default_rules_button_state()
+        self._refresh_dialog_size()
+
+    def _set_schedule_rules(
+        self,
+        rules: list[ScheduleRule],
+        selected_index: int | None = None,
+    ) -> None:
+        self._schedule_rules = [deepcopy(rule) for rule in rules]
+        if selected_index is None:
+            selected_index = self.schedule_graph.selected_index()
+        self.schedule_graph.set_rules(self._schedule_rules, selected_index=selected_index)
+        self._refresh_default_rules_button_state()
+        self._sync_selected_rule_editor()
+
+    def _handle_schedule_graph_rules_changed(self, rules: object) -> None:
+        if not isinstance(rules, list):
+            return
+        self._schedule_rules = [
+            deepcopy(rule) for rule in rules if isinstance(rule, ScheduleRule)
+        ]
+        self._refresh_default_rules_button_state()
+        self._sync_selected_rule_editor()
+
+    def _handle_schedule_graph_selection_changed(self, _index: int) -> None:
+        self._sync_selected_rule_editor()
+
+    def _set_combo_current_data(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _sync_selected_rule_editor(self) -> None:
+        selected_index = self.schedule_graph.selected_index()
+        selected_rule = (
+            self._schedule_rules[selected_index]
+            if 0 <= selected_index < len(self._schedule_rules)
+            else None
+        )
+        enabled = selected_rule is not None
+        self._syncing_rule_editor = True
+        try:
+            self.selected_rule_label.setText(
+                f"Point {selected_index + 1}/{len(self._schedule_rules)}"
+                if enabled
+                else "Point"
             )
-        if anchor_text in ("sunrise", "sunset"):
-            return ScheduleRule(
+            for widget in (
+                self.point_target_combo,
+                self.point_anchor_combo,
+                self.point_time_edit,
+                self.point_offset_spin,
+                self.point_brightness_spin,
+            ):
+                widget.setEnabled(enabled)
+            self.remove_rule_button.setEnabled(enabled)
+
+            if selected_rule is None:
+                self.point_time_edit.clear()
+                self.point_offset_spin.setValue(0)
+                self.point_brightness_spin.setValue(0)
+                return
+
+            self._set_combo_current_data(self.point_target_combo, selected_rule.target)
+            if selected_rule.anchor == "time":
+                self.point_anchor_combo.setCurrentText("specific time")
+            else:
+                self.point_anchor_combo.setCurrentText(selected_rule.anchor)
+            self.point_time_edit.setText(
+                _format_time_from_minutes(
+                    self.schedule_graph.clock_minutes_for_rule(selected_rule)
+                )
+            )
+            self.point_offset_spin.setValue(int(selected_rule.offset_minutes))
+            self.point_brightness_spin.setValue(clamp_brightness(selected_rule.brightness))
+            self._sync_rule_anchor_mode(
+                self.point_anchor_combo,
+                self.point_time_edit,
+                self.point_offset_spin,
+            )
+        finally:
+            self._syncing_rule_editor = False
+
+    def _handle_point_anchor_changed(self) -> None:
+        if self._syncing_rule_editor:
+            return
+        selected_index = self.schedule_graph.selected_index()
+        if (
+            _parse_time_to_minutes(self.point_time_edit.text()) is None
+            and 0 <= selected_index < len(self._schedule_rules)
+        ):
+            self.point_time_edit.setText(
+                _format_time_from_minutes(
+                    self.schedule_graph.clock_minutes_for_rule(
+                        self._schedule_rules[selected_index]
+                    )
+                )
+            )
+        self._syncing_rule_editor = True
+        try:
+            self._sync_rule_anchor_mode(
+                self.point_anchor_combo,
+                self.point_time_edit,
+                self.point_offset_spin,
+            )
+        finally:
+            self._syncing_rule_editor = False
+        self._apply_rule_editor_to_selected(time_is_source=True)
+
+    def _handle_point_offset_changed(self) -> None:
+        if self._syncing_rule_editor:
+            return
+        self._apply_rule_editor_to_selected(time_is_source=False)
+
+    def _rule_from_editor(
+        self,
+        time_is_source: bool = False,
+    ) -> tuple[ScheduleRule | None, str | None]:
+        selected_index = self.schedule_graph.selected_index()
+        if selected_index < 0 or selected_index >= len(self._schedule_rules):
+            return (None, None)
+
+        current_rule = self._schedule_rules[selected_index]
+        target = str(self.point_target_combo.currentData() or "").strip().lower()
+        if target not in ("display1", "display2", "both"):
+            target = "both"
+
+        anchor_text = self.point_anchor_combo.currentText().strip().lower()
+        brightness = clamp_brightness(self.point_brightness_spin.value())
+        if anchor_text == "specific time":
+            specific_time = self._normalize_time_text(self.point_time_edit.text())
+            if specific_time is None:
+                return (None, "specific time must be HH:MM (24-hour).")
+            return (
+                ScheduleRule(
+                    anchor="time",
+                    offset_minutes=0,
+                    brightness=brightness,
+                    target=target,
+                    specific_time=specific_time,
+                ),
+                None,
+            )
+
+        if anchor_text not in ("sunrise", "sunset"):
+            return (None, "anchor must be sunrise, sunset, or specific time.")
+
+        if time_is_source:
+            clock_minutes = _parse_time_to_minutes(self.point_time_edit.text())
+            if clock_minutes is None:
+                return (None, "time must be HH:MM (24-hour).")
+            previous_offset = (
+                int(current_rule.offset_minutes)
+                if current_rule.anchor in ("sunrise", "sunset")
+                else 0
+            )
+            offset_minutes = self.schedule_graph.offset_for_anchor_time(
+                anchor_text,
+                clock_minutes,
+                previous_offset,
+            )
+        else:
+            offset_minutes = int(self.point_offset_spin.value())
+
+        return (
+            ScheduleRule(
                 anchor=anchor_text,
-                offset_minutes=int(offset_widget.value()),
-                brightness=clamp_brightness(brightness_widget.value()),
+                offset_minutes=offset_minutes,
+                brightness=brightness,
                 target=target,
                 specific_time=None,
-            )
-        return None
+            ),
+            None,
+        )
+
+    def _apply_rule_editor_to_selected(self, time_is_source: bool = False) -> None:
+        if self._syncing_rule_editor:
+            return
+        selected_index = self.schedule_graph.selected_index()
+        if selected_index < 0 or selected_index >= len(self._schedule_rules):
+            return
+        rule, error = self._rule_from_editor(time_is_source=time_is_source)
+        if error is not None or rule is None:
+            return
+        if self._schedule_rules[selected_index] == rule:
+            return
+        self._remember_schedule_state()
+        self._schedule_rules[selected_index] = rule
+        self.schedule_graph.set_rules(self._schedule_rules, selected_index=selected_index)
+        self._refresh_default_rules_button_state()
+        if time_is_source:
+            self._syncing_rule_editor = True
+            try:
+                self.point_offset_spin.setValue(int(rule.offset_minutes))
+            finally:
+                self._syncing_rule_editor = False
+        else:
+            self._sync_selected_rule_editor()
 
     def _rules_match_exact_slice(self, start_index: int, expected_rules: list[ScheduleRule]) -> bool:
         for offset, expected_rule in enumerate(expected_rules):
-            actual_rule = self._rule_from_row(start_index + offset)
-            if actual_rule is None or actual_rule != expected_rule:
+            actual_rule = self._schedule_rules[start_index + offset]
+            if actual_rule != expected_rule:
                 return False
         return True
 
     def _has_untouched_default_sunrise_sunset_block(self) -> bool:
-        expected_rules = self._default_sunrise_sunset_ramp_rules()
-        expected_count = len(expected_rules)
-        row_count = self.rules_table.rowCount()
-        if row_count < expected_count:
-            return False
-
-        for start_index in range(0, row_count - expected_count + 1):
-            if self._rules_match_exact_slice(start_index, expected_rules):
-                return True
+        for target in ("display1", "display2", "both"):
+            expected_rules = self._default_sunrise_sunset_ramp_rules(target)
+            expected_count = len(expected_rules)
+            row_count = len(self._schedule_rules)
+            if row_count < expected_count:
+                continue
+            for start_index in range(0, row_count - expected_count + 1):
+                if self._rules_match_exact_slice(start_index, expected_rules):
+                    return True
         return False
 
     def _refresh_default_rules_button_state(self) -> None:
-        has_untouched_default_block = self._has_untouched_default_sunrise_sunset_block()
-        self.load_default_sun_rules_button.setVisible(not has_untouched_default_block)
-        self.load_default_sun_rules_button.setText("Add Default Sunrise/Sunset Rules to List")
+        self.load_default_sun_rules_button.setVisible(True)
+        self.load_default_sun_rules_button.setText("Apply Preset Curve")
         self.load_default_sun_rules_button.setToolTip(
-            "Add the preset sunrise/sunset ramp profile to the end of the list."
+            "Replace the selected display curve with the original default sunrise/sunset preset."
         )
-
-    def _add_rule_row(self, rule: ScheduleRule) -> None:
-        row_index = self.rules_table.rowCount()
-        self.rules_table.insertRow(row_index)
-
-        target_combo = QComboBox()
-        for value, label in self._build_target_choices():
-            target_combo.addItem(label, userData=value)
-        target_combo.setCurrentIndex(max(0, target_combo.findData(rule.target)))
-
-        anchor_combo = QComboBox()
-        anchor_combo.addItems(["sunrise", "sunset", "specific time"])
-        if rule.anchor == "time":
-            anchor_combo.setCurrentText("specific time")
-        else:
-            anchor_combo.setCurrentText(rule.anchor)
-
-        time_edit = QLineEdit()
-        time_edit.setPlaceholderText("HH:MM")
-        time_regex = QRegularExpression(r"^([01]?\d|2[0-3]):[0-5]\d$")
-        time_edit.setValidator(QRegularExpressionValidator(time_regex, self))
-        if rule.specific_time:
-            time_edit.setText(rule.specific_time)
-
-        offset_spin = QSpinBox()
-        offset_spin.setRange(-1440, 1440)
-        offset_spin.setValue(int(rule.offset_minutes))
-
-        brightness_spin = QSpinBox()
-        brightness_spin.setRange(0, 100)
-        brightness_spin.setValue(clamp_brightness(rule.brightness))
-
-        self.rules_table.setCellWidget(row_index, 0, target_combo)
-        self.rules_table.setCellWidget(row_index, 1, anchor_combo)
-        self.rules_table.setCellWidget(row_index, 2, time_edit)
-        self.rules_table.setCellWidget(row_index, 3, offset_spin)
-        self.rules_table.setCellWidget(row_index, 4, brightness_spin)
-
-        anchor_combo.currentTextChanged.connect(
-            lambda _text: self._sync_rule_anchor_mode(anchor_combo, time_edit, offset_spin)
-        )
-        target_combo.currentIndexChanged.connect(
-            lambda _index: self._refresh_default_rules_button_state()
-        )
-        anchor_combo.currentIndexChanged.connect(
-            lambda _index: self._refresh_default_rules_button_state()
-        )
-        time_edit.textChanged.connect(lambda _text: self._refresh_default_rules_button_state())
-        offset_spin.valueChanged.connect(lambda _value: self._refresh_default_rules_button_state())
-        brightness_spin.valueChanged.connect(
-            lambda _value: self._refresh_default_rules_button_state()
-        )
-        self._sync_rule_anchor_mode(anchor_combo, time_edit, offset_spin)
-        self._refresh_default_rules_button_state()
 
     def _sync_rule_anchor_mode(
         self, anchor_combo: QComboBox, time_edit: QLineEdit, offset_spin: QSpinBox
@@ -1085,95 +2143,78 @@ class SettingsDialog(QDialog):
         anchor_text = anchor_combo.currentText().strip().lower()
         is_specific_time = anchor_text == "specific time"
 
-        time_edit.setEnabled(is_specific_time)
+        time_edit.setEnabled(True)
         offset_spin.setEnabled(not is_specific_time)
         if is_specific_time:
             offset_spin.setValue(0)
             if not time_edit.text().strip():
                 time_edit.setText("12:00")
-        else:
-            time_edit.clear()
 
     def _remove_selected_rule(self) -> None:
-        current_row = self.rules_table.currentRow()
-        if current_row < 0:
+        selected_index = self.schedule_graph.selected_index()
+        if selected_index < 0 or selected_index >= len(self._schedule_rules):
             return
-        self.rules_table.removeRow(current_row)
-        self._refresh_default_rules_button_state()
+        self._remember_schedule_state()
+        updated_rules = [deepcopy(rule) for rule in self._schedule_rules]
+        updated_rules.pop(selected_index)
+        next_index = min(selected_index, len(updated_rules) - 1)
+        self._set_schedule_rules(updated_rules, selected_index=next_index)
         self._refresh_dialog_size()
 
     @staticmethod
     def _normalize_time_text(raw_text: str) -> str | None:
-        text = raw_text.strip()
-        if ":" not in text:
+        minutes = _parse_time_to_minutes(raw_text)
+        if minutes is None:
             return None
-        parts = text.split(":", 1)
-        if len(parts) != 2:
-            return None
-        try:
-            hour = int(parts[0])
-            minute = int(parts[1])
-        except (TypeError, ValueError):
-            return None
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            return None
-        return f"{hour:02d}:{minute:02d}"
+        return _format_time_from_minutes(minutes)
 
     def _collect_rules(self) -> tuple[list[ScheduleRule], str | None]:
-        rules: list[ScheduleRule] = []
-        for row_index in range(self.rules_table.rowCount()):
-            target_widget = self.rules_table.cellWidget(row_index, 0)
-            anchor_widget = self.rules_table.cellWidget(row_index, 1)
-            time_widget = self.rules_table.cellWidget(row_index, 2)
-            offset_widget = self.rules_table.cellWidget(row_index, 3)
-            brightness_widget = self.rules_table.cellWidget(row_index, 4)
-            if not isinstance(target_widget, QComboBox):
-                continue
-            if not isinstance(anchor_widget, QComboBox):
-                continue
-            if not isinstance(time_widget, QLineEdit):
-                continue
-            if not isinstance(offset_widget, QSpinBox):
-                continue
-            if not isinstance(brightness_widget, QSpinBox):
-                continue
+        rules = [deepcopy(rule) for rule in self._schedule_rules]
+        selected_index = self.schedule_graph.selected_index()
+        if 0 <= selected_index < len(rules):
+            editor_rule, error = self._rule_from_editor(time_is_source=True)
+            if error is not None:
+                return ([], f"Point {selected_index + 1}: {error}")
+            if editor_rule is not None:
+                rules[selected_index] = editor_rule
 
-            target = str(target_widget.currentData() or "").strip().lower()
+        normalized_rules: list[ScheduleRule] = []
+        for rule_index, rule in enumerate(rules):
+            target = str(rule.target).strip().lower()
             if target not in ("display1", "display2", "both"):
                 target = "both"
 
-            anchor_text = anchor_widget.currentText().strip().lower()
-            if anchor_text == "specific time":
-                specific_time = self._normalize_time_text(time_widget.text())
+            if rule.anchor == "time":
+                specific_time = self._normalize_time_text(rule.specific_time or "")
                 if specific_time is None:
-                    return ([], f"Rule {row_index + 1}: specific time must be HH:MM (24-hour).")
-                rules.append(
+                    return ([], f"Point {rule_index + 1}: specific time must be HH:MM (24-hour).")
+                normalized_rules.append(
                     ScheduleRule(
                         anchor="time",
                         offset_minutes=0,
-                        brightness=clamp_brightness(brightness_widget.value()),
+                        brightness=clamp_brightness(rule.brightness),
                         target=target,
                         specific_time=specific_time,
                     )
                 )
                 continue
 
-            if anchor_text not in ("sunrise", "sunset"):
+            if rule.anchor not in ("sunrise", "sunset"):
                 continue
 
-            rules.append(
+            normalized_rules.append(
                 ScheduleRule(
-                    anchor=anchor_text,
-                    offset_minutes=int(offset_widget.value()),
-                    brightness=clamp_brightness(brightness_widget.value()),
+                    anchor=rule.anchor,
+                    offset_minutes=max(-1440, min(1440, int(rule.offset_minutes))),
+                    brightness=clamp_brightness(rule.brightness),
                     target=target,
                     specific_time=None,
                 )
             )
-        return (rules, None)
+        return (normalized_rules, None)
 
     def _save_and_close(self) -> None:
-        self._refresh_auto_location(refresh_detection=True)
+        self._refresh_auto_location(refresh_detection=False)
 
         rules, error = self._collect_rules()
         if error:
@@ -1298,10 +2339,14 @@ class BrightnessControlWindow(QWidget):
         self.combined_label = QLabel("All displays")
         self.global_slider = QSlider(Qt.Orientation.Horizontal)
         self.global_slider.setRange(0, 100)
+        _apply_brightness_slider_style(self.global_slider, self.config.last_global_brightness)
         self.global_value_label = QLabel("0%")
         self.global_value_label.setMinimumWidth(40)
         self.global_value_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.global_value_label.setStyleSheet(
+            _brightness_value_label_style(self.config.last_global_brightness)
         )
         combined_layout.addWidget(self.combined_label)
         combined_layout.addWidget(self.global_slider, stretch=1)
@@ -1610,7 +2655,9 @@ class BrightnessControlWindow(QWidget):
 
     def _handle_global_slider_change(self, value: int) -> None:
         bounded = clamp_brightness(value)
+        _apply_brightness_slider_style(self.global_slider, bounded)
         self.global_value_label.setText(f"{bounded}%")
+        self.global_value_label.setStyleSheet(_brightness_value_label_style(bounded))
         if self._internal_ui_update:
             return
         if not self.config.link_mode:
@@ -1774,7 +2821,9 @@ class BrightnessControlWindow(QWidget):
         bounded = clamp_brightness(value)
         self._internal_ui_update = True
         self.global_slider.setValue(bounded)
+        _apply_brightness_slider_style(self.global_slider, bounded)
         self.global_value_label.setText(f"{bounded}%")
+        self.global_value_label.setStyleSheet(_brightness_value_label_style(bounded))
         self._internal_ui_update = False
 
     def _update_link_mode_ui(self) -> None:
