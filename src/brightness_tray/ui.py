@@ -3,24 +3,23 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import math
-from pathlib import Path
-import sys
 import time as wall_time
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QRegularExpression, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QRegularExpression, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QCursor,
     QFont,
+    QFontMetrics,
     QGuiApplication,
     QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
-    QPixmap,
+    QRadialGradient,
     QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
@@ -30,6 +29,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
+    QFrame,
     QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
@@ -51,46 +52,49 @@ from astral.sun import sun
 from tzlocal import get_localzone_name
 
 from .ambient_light import AmbientLightService
-from .brightness_service import BrightnessService, MonitorHandle, PictureControl
+from .brightness_service import (
+    BrightnessService,
+    BrightnessWriter,
+    MonitorHandle,
+    PictureControl,
+    com_initialized,
+)
 from .config_store import ConfigStore
+from .glass import (
+    GlassTitleBar,
+    GlowSlider,
+    ThemeSwatchButton,
+    animate_in,
+    apply_backdrop,
+    brightness_color,
+    paint_glass,
+    set_blur_enabled,
+)
+from .icons import app_glyph_pixmap, glyph_icon
 from .location import LocationContext, detect_location_context_from_ip
 from .models import AppConfig, ScheduleRule, clamp_brightness, default_schedule_rules
 from .themes import (
-    THEME_DARK,
-    THEME_GRAY,
-    THEME_LIGHT,
-    THEME_SAND,
+    THEME_OPTIONS,
+    active_theme,
     build_stylesheet,
     normalize_theme_name,
+    qcolor,
+    set_active_theme,
 )
+from .workers import run_async
 
-def _resolve_icon_path(filename: str) -> Path | None:
-    module_dir = Path(__file__).resolve().parent
-    candidate_paths = [
-        module_dir / "assets" / "icons" / filename,
-    ]
-
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        pyinstaller_root = Path(meipass)
-        # Support both legacy and corrected PyInstaller data targets.
-        candidate_paths.extend(
-            [
-                pyinstaller_root / "src" / "brightness_tray" / "assets" / "icons" / filename,
-                pyinstaller_root / "brightness_tray" / "assets" / "icons" / filename,
-            ]
-        )
-
-    for candidate in candidate_paths:
-        if candidate.exists():
-            return candidate
-    return None
+POPUP_EDGE_MARGIN_PX = 12
+POPUP_TASKBAR_CLEARANCE_PX = 6
 
 
-REFRESH_ICON_PATH = _resolve_icon_path("refresh.png")
-SETTINGS_ICON_PATH = _resolve_icon_path("settings.png")
-POPUP_EDGE_MARGIN_PX = 10
-POPUP_TASKBAR_CLEARANCE_PX = 8
+def apply_app_theme(theme_name: str) -> None:
+    """Switch the active theme everywhere (stylesheet + custom-painted widgets)."""
+    app = QApplication.instance()
+    normalized = set_active_theme(theme_name)
+    if app is not None:
+        app.setStyleSheet(build_stylesheet(normalized.key))
+        for widget in app.topLevelWidgets():
+            widget.update()
 
 
 def _format_time_from_minutes(minutes: int | float) -> str:
@@ -121,119 +125,100 @@ def _round_to_step(value: float, step: int) -> int:
     return int(round(value / step) * step)
 
 
-def _mix_channel(start: int, end: int, ratio: float) -> int:
-    return max(0, min(255, int(round(start + (end - start) * ratio))))
-
-
-def _mix_color(start: QColor, end: QColor, ratio: float) -> QColor:
-    bounded = max(0.0, min(1.0, ratio))
-    return QColor(
-        _mix_channel(start.red(), end.red(), bounded),
-        _mix_channel(start.green(), end.green(), bounded),
-        _mix_channel(start.blue(), end.blue(), bounded),
-    )
-
-
 def _brightness_handle_color(value: int | float) -> QColor:
-    ratio = max(0.0, min(1.0, float(value) / 100.0))
-    if ratio < 0.45:
-        return _mix_color(QColor("#64748b"), QColor("#38bdf8"), ratio / 0.45)
-    return _mix_color(QColor("#38bdf8"), QColor("#60a5fa"), (ratio - 0.45) / 0.55)
-
-
-def _brightness_slider_stylesheet(value: int | float) -> str:
-    handle = _brightness_handle_color(value).name()
-    return f"""
-    QSlider::groove:horizontal {{
-        height: 10px;
-        border-radius: 5px;
-        border: 1px solid rgba(148, 163, 184, 92);
-        background: qlineargradient(
-            x1: 0, y1: 0, x2: 1, y2: 0,
-            stop: 0 #334155,
-            stop: 0.45 #38bdf8,
-            stop: 1 #60a5fa
-        );
-    }}
-    QSlider::sub-page:horizontal {{
-        border-radius: 5px;
-        background: transparent;
-    }}
-    QSlider::add-page:horizontal {{
-        border-radius: 5px;
-        background: transparent;
-    }}
-    QSlider::handle:horizontal {{
-        width: 20px;
-        height: 20px;
-        margin: -7px 0;
-        border-radius: 10px;
-        background: {handle};
-        border: 2px solid rgba(255, 255, 255, 215);
-    }}
-    QSlider::handle:horizontal:hover {{
-        border: 2px solid rgba(255, 255, 255, 245);
-    }}
-    """
+    return brightness_color(float(value) / 100.0)
 
 
 def _apply_brightness_slider_style(slider: QSlider, value: int | float) -> None:
-    slider.setStyleSheet(_brightness_slider_stylesheet(value))
+    del value
+    slider.update()
 
 
 def _brightness_value_label_style(value: int | float) -> str:
-    color = _brightness_handle_color(value).name()
-    return f"font-weight: 600; color: {color};"
+    color = _brightness_handle_color(value)
+    if not active_theme().dark:
+        # The sunlit end of the ramp is too pale to read on light glass.
+        color = color.darker(150 if value > 60 else 105)
+    return f"font-weight: 600; color: {color.name()};"
+
+
+def _big_value_style(value: int | float) -> str:
+    color = _brightness_handle_color(value)
+    if not active_theme().dark:
+        color = color.darker(150 if value > 60 else 105)
+    return f"color: {color.name()};"
 
 
 def _bottom_right_popup_position(widget: QWidget, available) -> QPoint:
+    """Anchor the popup to the corner next to the taskbar / tray."""
     frame = widget.frameGeometry()
-    desired_x = available.right() - frame.width() - POPUP_EDGE_MARGIN_PX + 1
-    desired_y = (
-        available.bottom()
-        - frame.height()
-        - (POPUP_EDGE_MARGIN_PX + POPUP_TASKBAR_CLEARANCE_PX)
-        + 1
-    )
-    max_x = available.right() - frame.width() + 1
-    max_y = available.bottom() - frame.height() + 1
-    target_x = max(available.left(), min(desired_x, max_x))
-    target_y = available.top() if desired_y < available.top() else min(desired_y, max_y)
+    screen = widget.screen() or QGuiApplication.primaryScreen()
+    full = screen.geometry() if screen is not None else available
+    margin = POPUP_EDGE_MARGIN_PX
+    clearance = POPUP_TASKBAR_CLEARANCE_PX
+
+    at_left = available.left() > full.left()
+    at_top = available.top() > full.top()
+
+    if at_left:
+        target_x = available.left() + clearance
+    else:
+        target_x = available.right() - frame.width() - (clearance if available.right() < full.right() else margin) + 1
+    if at_top:
+        target_y = available.top() + clearance
+    else:
+        target_y = available.bottom() - frame.height() - (clearance if available.bottom() < full.bottom() else margin) + 1
+
+    target_x = max(available.left(), min(target_x, available.right() - frame.width() + 1))
+    target_y = max(available.top(), min(target_y, available.bottom() - frame.height() + 1))
     return QPoint(target_x, target_y)
 
 
+def _slide_offset_for(widget: QWidget) -> QPoint:
+    screen = widget.screen() or QGuiApplication.primaryScreen()
+    if screen is None:
+        return QPoint(0, 14)
+    available = screen.availableGeometry()
+    full = screen.geometry()
+    if available.left() > full.left():
+        return QPoint(-14, 0)
+    if available.right() < full.right():
+        return QPoint(14, 0)
+    if available.top() > full.top():
+        return QPoint(0, -14)
+    return QPoint(0, 14)
+
+
 def _apply_native_rounded_corners(widget: QWidget) -> None:
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception:
-        return
-
-    try:
-        hwnd = int(widget.winId())
-    except Exception:
-        return
-    if hwnd <= 0:
-        return
-
-    # DWM window corner preference (Windows 11+).
-    dwm_window_corner_preference = 33
-    dwmcp_round = 2
-    corner_pref = ctypes.c_int(dwmcp_round)
-    try:
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            wintypes.HWND(hwnd),
-            ctypes.c_uint(dwm_window_corner_preference),
-            ctypes.byref(corner_pref),
-            ctypes.sizeof(corner_pref),
-        )
-    except Exception:
-        return
+    apply_backdrop(widget)
 
 
 def _apply_rounded_popup_chrome(widget: QWidget, object_name: str) -> None:
     widget.setObjectName(object_name)
-    _apply_native_rounded_corners(widget)
+    widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    widget.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+
+
+def _flat_tool_button(icon_kind: str, tooltip: str) -> QToolButton:
+    button = QToolButton()
+    button.setToolTip(tooltip)
+    button.setIconSize(QSize(18, 18))
+    button.setFixedSize(34, 34)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setProperty("iconKind", icon_kind)
+    button.setIcon(glyph_icon(icon_kind, active_theme().fg))
+    return button
+
+
+def _refresh_flat_button_icon(button: QToolButton) -> None:
+    kind = button.property("iconKind")
+    if kind:
+        button.setIcon(glyph_icon(str(kind), active_theme().fg))
+
+
+def _elided(label: QLabel, text: str, width: int) -> None:
+    label.setToolTip(text)
+    label.setText(QFontMetrics(label.font()).elidedText(text, Qt.TextElideMode.ElideRight, width))
 
 
 class MonitorSliderRow(QWidget):
@@ -243,39 +228,57 @@ class MonitorSliderRow(QWidget):
         super().__init__(parent)
         self.monitor = monitor
 
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        self.name_label = QLabel(monitor.name)
-        self.name_label.setMinimumWidth(120)
-        layout.addWidget(self.name_label)
+        header = QHBoxLayout()
+        header.setContentsMargins(2, 0, 2, 0)
+        header.setSpacing(8)
+        is_builtin = "wmi" in (monitor.method_name or "").lower()
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(18, 18)
+        self.icon_label.setScaledContents(True)
+        self._icon_kind = "laptop" if is_builtin else "monitor"
+        self._refresh_icon()
+        header.addWidget(self.icon_label)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.name_label = QLabel()
+        _elided(self.name_label, monitor.name, 270)
+        header.addWidget(self.name_label, stretch=1)
+
+        self.value_label = QLabel(f"{clamp_brightness(initial_value)}%")
+        self.value_label.setMinimumWidth(44)
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.value_label)
+        layout.addLayout(header)
+
+        self.slider = GlowSlider(Qt.Orientation.Horizontal, brightness_scale=True)
         self.slider.setRange(0, 100)
         self.slider.setValue(clamp_brightness(initial_value))
-        _apply_brightness_slider_style(self.slider, self.slider.value())
-        layout.addWidget(self.slider, stretch=1)
-
-        self.value_label = QLabel(f"{self.slider.value()}%")
-        self.value_label.setMinimumWidth(40)
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.slider)
         self.value_label.setStyleSheet(_brightness_value_label_style(self.slider.value()))
-        layout.addWidget(self.value_label)
 
         self.slider.valueChanged.connect(self._handle_slider_change)
+
+    def _refresh_icon(self) -> None:
+        self.icon_label.setPixmap(glyph_icon(self._icon_kind, active_theme().muted).pixmap(36, 36))
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.StyleChange:
+            self._refresh_icon()
+        return super().event(event)
 
     def set_value(self, value: int) -> None:
         bounded = clamp_brightness(value)
         self.slider.blockSignals(True)
         self.slider.setValue(bounded)
         self.slider.blockSignals(False)
-        _apply_brightness_slider_style(self.slider, bounded)
         self.value_label.setText(f"{bounded}%")
         self.value_label.setStyleSheet(_brightness_value_label_style(bounded))
 
     def _handle_slider_change(self, value: int) -> None:
         bounded = clamp_brightness(value)
-        _apply_brightness_slider_style(self.slider, bounded)
         self.value_label.setText(f"{bounded}%")
         self.value_label.setStyleSheet(_brightness_value_label_style(bounded))
         self.brightness_changed.emit(self.monitor.key, bounded)
@@ -293,12 +296,14 @@ class PictureControlSliderRow(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-        self.name_label = QLabel(f"{control.name} (0x{control.code:02X})")
-        self.name_label.setMinimumWidth(190)
+        self.name_label = QLabel(control.name)
+        self.name_label.setToolTip(f"VCP code 0x{control.code:02X}")
+        self.name_label.setMinimumWidth(130)
         layout.addWidget(self.name_label)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = GlowSlider(Qt.Orientation.Horizontal, brightness_scale=False)
         self.slider.setRange(control.minimum, control.maximum)
         self.slider.setValue(control.value)
         layout.addWidget(self.slider, stretch=1)
@@ -374,41 +379,53 @@ class PictureControlsDialog(QDialog):
         self.monitors = monitors
 
         self.setWindowTitle("Monitor Picture Controls")
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setMinimumWidth(620)
-        self.resize(700, 420)
+        self.setMinimumWidth(560)
+        self.resize(620, 420)
         _apply_rounded_popup_chrome(self, "pictureControlsDialog")
 
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(6, 6, 6, 6)
-        root_layout.setSpacing(6)
+        root_layout.setContentsMargins(0, 0, 0, 12)
+        root_layout.setSpacing(8)
 
+        self.title_bar = GlassTitleBar("Picture Controls", self.reject)
+        root_layout.addWidget(self.title_bar)
+
+        body_margin = 16
         toolbar_layout = QHBoxLayout()
-        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setContentsMargins(body_margin, 0, body_margin, 0)
         toolbar_layout.setSpacing(8)
-        self.refresh_button = QPushButton("Refresh Controls (Deep Scan)")
+        self.refresh_button = QPushButton("Deep scan for controls")
+        self.refresh_button.setToolTip(
+            "Ask each monitor which picture settings it supports (slower, but finds more)."
+        )
         toolbar_layout.addWidget(self.refresh_button)
         toolbar_layout.addStretch(1)
         root_layout.addLayout(toolbar_layout)
 
         self.content_scroll = QScrollArea()
         self.content_scroll.setWidgetResizable(True)
-        root_layout.addWidget(self.content_scroll, stretch=1)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_row = QHBoxLayout()
+        scroll_row.setContentsMargins(body_margin, 0, body_margin - 6, 0)
+        scroll_row.addWidget(self.content_scroll)
+        root_layout.addLayout(scroll_row, stretch=1)
 
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
-        self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(10)
+        self.content_layout.setContentsMargins(0, 0, 6, 0)
+        self.content_layout.setSpacing(6)
         self.content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.content_scroll.setWidget(self.content_widget)
 
         self.status_label = QLabel("")
+        self.status_label.setObjectName("muted")
         self.status_label.setWordWrap(True)
         footer_layout = QHBoxLayout()
-        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setContentsMargins(body_margin, 0, body_margin, 0)
         footer_layout.setSpacing(8)
         footer_layout.addWidget(self.status_label, stretch=1)
-        self.close_button = QPushButton("Close")
+        self.close_button = QPushButton("Done")
+        self.close_button.setObjectName("primary")
         self.close_button.clicked.connect(self.reject)
         footer_layout.addWidget(self.close_button)
         root_layout.addLayout(footer_layout)
@@ -439,9 +456,10 @@ class PictureControlsDialog(QDialog):
         static_height = (
             margins.top()
             + margins.bottom()
+            + self.title_bar.height()
             + self.refresh_button.sizeHint().height()
             + max(self.status_label.sizeHint().height(), self.close_button.sizeHint().height())
-            + (spacing * 2)
+            + (spacing * 3)
         )
         preferred_content = self._content_table_height()
         max_height = self._max_dialog_height()
@@ -480,6 +498,12 @@ class PictureControlsDialog(QDialog):
         _apply_native_rounded_corners(self)
         QTimer.singleShot(0, self._refresh_dialog_size)
 
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        paint_glass(self, painter)
+        painter.end()
+
     def _clear_content(self) -> None:
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
@@ -499,7 +523,7 @@ class PictureControlsDialog(QDialog):
             group = QGroupBox(monitor.name)
             group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
             group_layout = QVBoxLayout(group)
-            group_layout.setContentsMargins(8, 4, 8, 8)
+            group_layout.setContentsMargins(6, 6, 6, 4)
             group_layout.setSpacing(8)
 
             try:
@@ -511,6 +535,7 @@ class PictureControlsDialog(QDialog):
             except Exception as error:
                 controls = []
                 failure_label = QLabel(f"Could not read controls: {error}")
+                failure_label.setObjectName("muted")
                 failure_label.setWordWrap(True)
                 group_layout.addWidget(failure_label)
 
@@ -518,6 +543,7 @@ class PictureControlsDialog(QDialog):
                 unsupported_label = QLabel(
                     "No supported picture controls were reported by this display."
                 )
+                unsupported_label.setObjectName("muted")
                 unsupported_label.setWordWrap(True)
                 group_layout.addWidget(unsupported_label)
             else:
@@ -575,6 +601,10 @@ class ScheduleGraphWidget(QWidget):
     _BOTTOM_MARGIN = 38
     _HIT_RADIUS = 12
     _DRAG_MINUTE_STEP = 5
+    _STARS = tuple(
+        (((index * 0.61803398875) % 1.0), ((index * 0.7548776662) % 1.0), 0.9 + (index % 3) * 0.35)
+        for index in range(1, 46)
+    )
 
     def __init__(
         self,
@@ -675,16 +705,10 @@ class ScheduleGraphWidget(QWidget):
     @staticmethod
     def _target_color(target: str) -> QColor:
         if target == "display1":
-            return QColor("#2f80ed")
+            return QColor("#4d9bff")
         if target == "display2":
-            return QColor("#22c55e")
-        return QColor("#f59e0b")
-
-    def _panel_text_color(self) -> QColor:
-        panel_color = QColor(self.palette().window().color())
-        if panel_color.lightness() < 120:
-            return QColor("#e5e7eb")
-        return QColor("#475569")
+            return QColor("#3ddc97")
+        return QColor("#ffb347")
 
     def _plot_rect(self) -> QRectF:
         return QRectF(
@@ -870,6 +894,7 @@ class ScheduleGraphWidget(QWidget):
                     "Double-click the graph to add a point. Drag points to change time and brightness."
                 )
                 self.unsetCursor()
+            self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
@@ -944,10 +969,13 @@ class ScheduleGraphWidget(QWidget):
         sunrise = self._effective_sunrise_minutes()
         sunset = self._effective_sunset_minutes()
         painter.save()
-        painter.setClipRect(plot)
+        clip = QPainterPath()
+        clip.addRoundedRect(plot, 12, 12)
+        painter.setClipPath(clip)
 
         sky_gradient = QLinearGradient(plot.left(), 0, plot.right(), 0)
-        stops: list[tuple[float, QColor]] = [(0.0, QColor("#0f172a")), (1.0, QColor("#0f172a"))]
+        night = "#0b1226"
+        stops: list[tuple[float, QColor]] = [(0.0, QColor(night)), (1.0, QColor(night))]
 
         def add_stop(minutes: int | float, color: str) -> None:
             if minutes < 0 or minutes > 1440:
@@ -956,32 +984,64 @@ class ScheduleGraphWidget(QWidget):
 
         if sunset > sunrise:
             midday = sunrise + (sunset - sunrise) / 2.0
-            add_stop(sunrise - 210, "#0f172a")
-            add_stop(sunrise - 135, "#1e3a8a")
-            add_stop(sunrise - 72, "#fb923c")
-            add_stop(sunrise + 16, "#fde68a")
-            add_stop(sunrise + 125, "#7dd3fc")
-            add_stop(midday, "#bfdbfe")
-            add_stop(sunset - 125, "#7dd3fc")
-            add_stop(sunset - 18, "#fecdd3")
-            add_stop(sunset + 78, "#be123c")
-            add_stop(sunset + 155, "#0f172a")
+            add_stop(sunrise - 210, night)
+            add_stop(sunrise - 135, "#1e2a78")
+            add_stop(sunrise - 72, "#d9663a")
+            add_stop(sunrise + 16, "#f6c667")
+            add_stop(sunrise + 125, "#5fb4ee")
+            add_stop(midday, "#9cc9f5")
+            add_stop(sunset - 125, "#5fb4ee")
+            add_stop(sunset - 18, "#f0a4b4")
+            add_stop(sunset + 78, "#8e1a52")
+            add_stop(sunset + 155, night)
         else:
-            add_stop(360, "#f97316")
-            add_stop(420, "#7dd3fc")
-            add_stop(720, "#bfdbfe")
-            add_stop(1080, "#fb7185")
+            add_stop(360, "#d9663a")
+            add_stop(420, "#5fb4ee")
+            add_stop(720, "#9cc9f5")
+            add_stop(1080, "#e0607a")
 
         for position, color in sorted(stops, key=lambda stop: stop[0]):
             sky_gradient.setColorAt(position, color)
-
         painter.fillRect(plot, QBrush(sky_gradient))
 
+        # Stars fade in over the night stretches.
+        night_start = (sunset + 70) % 1440
+        night_end = sunrise - 70
+        painter.setPen(Qt.PenStyle.NoPen)
+        for u_pos, v_pos, size in self._STARS:
+            minute = u_pos * 1440.0
+            in_night = (
+                minute >= night_start or minute <= night_end
+                if night_start > night_end
+                else night_start <= minute <= night_end
+            )
+            if not in_night:
+                continue
+            painter.setBrush(QBrush(QColor(255, 255, 255, 150 if size > 1.3 else 95)))
+            painter.drawEllipse(
+                QPointF(plot.left() + u_pos * plot.width(), plot.top() + 6 + v_pos * plot.height() * 0.55),
+                size,
+                size,
+            )
+
+        # Darken slightly toward the bottom so curves pop.
+        shade = QLinearGradient(0, plot.top(), 0, plot.bottom())
+        shade.setColorAt(0.0, QColor(0, 0, 0, 0))
+        shade.setColorAt(1.0, QColor(0, 0, 0, 90))
+        painter.fillRect(plot, QBrush(shade))
         painter.restore()
 
     def _draw_sun_icon(self, painter: QPainter, center: QPointF, color: QColor) -> None:
         painter.save()
-        painter.setPen(QPen(color, 1))
+        glow = QRadialGradient(center, 20)
+        glow_color = QColor(color)
+        glow_color.setAlpha(110)
+        glow.setColorAt(0.0, glow_color)
+        glow.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(glow))
+        painter.drawEllipse(center, 20, 20)
+        painter.setPen(QPen(color, 1.4))
         painter.setBrush(QBrush(color))
         painter.drawEllipse(center, 5, 5)
         for index in range(8):
@@ -994,7 +1054,7 @@ class ScheduleGraphWidget(QWidget):
     def _draw_moon_icon(self, painter: QPainter, center: QPointF, mask_color: QColor) -> None:
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor("#e5e7eb")))
+        painter.setBrush(QBrush(QColor("#e8edf9")))
         painter.drawEllipse(center, 6, 6)
         painter.setBrush(QBrush(mask_color))
         painter.drawEllipse(QPointF(center.x() + 4, center.y() - 2), 6, 6)
@@ -1010,20 +1070,20 @@ class ScheduleGraphWidget(QWidget):
     ) -> None:
         x_pos = self._x_from_minutes(minutes, plot)
         line_color = QColor(color)
-        line_color.setAlpha(150)
-        painter.setPen(QPen(line_color, 1))
-        painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
+        line_color.setAlpha(110)
+        pen = QPen(line_color, 1)
+        pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(x_pos, plot.top() + 28), QPointF(x_pos, plot.bottom()))
         self._draw_sun_icon(painter, QPointF(x_pos, plot.top() + 18), color)
-        painter.setPen(QPen(QColor("#f8fafc"), 1))
-        painter.drawText(
-            QRectF(x_pos - 34, plot.top() + 30, 68, 18),
-            Qt.AlignmentFlag.AlignCenter,
-            label,
-        )
+        label_rect = QRectF(x_pos - 34, plot.top() + 31, 68, 16)
+        painter.setPen(QPen(QColor(0, 0, 0, 150), 1))
+        painter.drawText(label_rect.translated(0.8, 0.8), Qt.AlignmentFlag.AlignCenter, label)
+        painter.setPen(QPen(QColor(255, 255, 255, 235), 1))
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
 
     def _draw_axes(self, painter: QPainter, plot: QRectF) -> None:
-        grid_pen = QPen(QColor(255, 255, 255, 70), 1)
-        text_color = self._panel_text_color()
+        text_color = QColor(active_theme().muted)
         small_font = QFont(painter.font())
         point_size = small_font.pointSizeF()
         small_font.setPointSizeF(8.0 if point_size <= 0 else max(8.0, point_size * 0.82))
@@ -1031,8 +1091,10 @@ class ScheduleGraphWidget(QWidget):
 
         for brightness in (100, 75, 50, 25, 0):
             y_pos = self._y_from_brightness(brightness, plot)
+            grid_pen = QPen(QColor(255, 255, 255, 46 if brightness not in (0, 100) else 28), 1)
+            grid_pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(grid_pen)
-            painter.drawLine(QPointF(plot.left(), y_pos), QPointF(plot.right(), y_pos))
+            painter.drawLine(QPointF(plot.left() + 6, y_pos), QPointF(plot.right() - 6, y_pos))
             painter.setPen(QPen(text_color, 1))
             painter.drawText(
                 QRectF(4, y_pos - 9, self._LEFT_MARGIN - 10, 18),
@@ -1048,8 +1110,9 @@ class ScheduleGraphWidget(QWidget):
             (1440, "24:00"),
         ):
             x_pos = plot.right() if minutes == 1440 else self._x_from_minutes(minutes, plot)
-            painter.setPen(QPen(QColor(255, 255, 255, 55), 1))
-            painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
+            tick_pen = QPen(QColor(255, 255, 255, 30), 1)
+            painter.setPen(tick_pen)
+            painter.drawLine(QPointF(x_pos, plot.top() + 6), QPointF(x_pos, plot.bottom() - 6))
             painter.setPen(QPen(text_color, 1))
             painter.drawText(
                 QRectF(x_pos - 28, plot.bottom() + 8, 56, 18),
@@ -1057,23 +1120,11 @@ class ScheduleGraphWidget(QWidget):
                 label,
             )
 
-    def _draw_interpolation_path(
-        self,
-        painter: QPainter,
-        plot: QRectF,
-        allowed_targets: set[str],
-        color: QColor,
-    ) -> None:
-        if allowed_targets == {"both", "display1"}:
-            points = self._points_for_display_curve("display1")
-        elif allowed_targets == {"both", "display2"}:
-            points = self._points_for_display_curve("display2")
-        else:
-            points = self._points_for_target_values(allowed_targets)
+    def _curve_path(self, plot: QRectF, points: list[tuple[int, int]]) -> QPainterPath | None:
         if not points:
-            return
+            return None
         path = QPainterPath()
-        sample_count = 180
+        sample_count = 240
         first = True
         for sample_index in range(sample_count + 1):
             minutes = (1440.0 / sample_count) * sample_index
@@ -1081,7 +1132,7 @@ class ScheduleGraphWidget(QWidget):
             if value is None:
                 continue
             point = QPointF(
-                self._x_from_minutes(min(minutes, 1439.0), plot),
+                self._x_from_minutes(min(minutes, 1439.99), plot),
                 self._y_from_brightness(value, plot),
             )
             if first:
@@ -1089,67 +1140,121 @@ class ScheduleGraphWidget(QWidget):
                 first = False
             else:
                 path.lineTo(point)
-        path_color = QColor(color)
-        path_color.setAlpha(210)
-        painter.setPen(QPen(path_color, 3))
+        return path
+
+    def _draw_interpolation_path(
+        self,
+        painter: QPainter,
+        plot: QRectF,
+        target: str,
+        color: QColor,
+    ) -> None:
+        points = self._points_for_display_curve(target)
+        path = self._curve_path(plot, points)
+        if path is None:
+            return
+
+        painter.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(plot, 12, 12)
+        painter.setClipPath(clip)
+
+        area = QPainterPath(path)
+        area.lineTo(plot.right(), plot.bottom())
+        area.lineTo(plot.left(), plot.bottom())
+        area.closeSubpath()
+        fill = QLinearGradient(0, plot.top(), 0, plot.bottom())
+        top_color = QColor(color)
+        top_color.setAlpha(70)
+        bottom_color = QColor(color)
+        bottom_color.setAlpha(0)
+        fill.setColorAt(0.0, top_color)
+        fill.setColorAt(1.0, bottom_color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(fill))
+        painter.drawPath(area)
+
+        glow_color = QColor(color)
+        glow_color.setAlpha(55)
+        glow_pen = QPen(glow_color, 8)
+        glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        glow_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(glow_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
+
+        line_pen = QPen(QColor(color).lighter(115), 2.6)
+        line_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        line_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(line_pen)
+        painter.drawPath(path)
+        painter.restore()
 
     def _draw_now_marker(self, painter: QPainter, plot: QRectF) -> None:
         if self._now_minutes is None:
             return
         x_pos = self._x_from_minutes(self._now_minutes, plot)
-        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
-        painter.drawLine(QPointF(x_pos, plot.top()), QPointF(x_pos, plot.bottom()))
-        painter.drawText(
-            QRectF(x_pos - 24, plot.top() - 2, 48, 18),
-            Qt.AlignmentFlag.AlignCenter,
-            "Now",
-        )
-        for allowed, target in (
-            ({"both", "display1"}, "display1"),
-            ({"both", "display2"}, "display2"),
-        ):
-            if target == "display1":
-                target_points = self._points_for_display_curve("display1")
-            else:
-                target_points = self._points_for_display_curve("display2")
+        now_pen = QPen(QColor(255, 255, 255, 190), 1)
+        now_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(now_pen)
+        painter.drawLine(QPointF(x_pos, plot.top() + 16), QPointF(x_pos, plot.bottom()))
+
+        pill = QRectF(x_pos - 20, plot.top() - 1, 40, 17)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        painter.drawRoundedRect(pill, 8.5, 8.5)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, "Now")
+
+        for target in ("display1", "display2"):
+            target_points = self._points_for_display_curve(target)
             value = self._value_for_minute(target_points, self._now_minutes)
             if value is None:
                 continue
             color = self._target_color(target)
             painter.setPen(QPen(QColor("#ffffff"), 2))
             painter.setBrush(QBrush(color))
-            painter.drawEllipse(
-                QPointF(x_pos, self._y_from_brightness(value, plot)),
-                5,
-                5,
-            )
+            painter.drawEllipse(QPointF(x_pos, self._y_from_brightness(value, plot)), 5, 5)
 
     def _draw_points(self, painter: QPainter, plot: QRectF) -> None:
         points = self._point_positions(plot)
         points.sort(key=lambda item: item[0] == self._selected_index)
         for index, point, rule in points:
             selected = index == self._selected_index
+            hovered = index == self._hover_index
             color = self._target_color(rule.target)
-            radius = 9 if selected else 7
-            if selected:
-                halo = QColor("#ffffff")
-                halo.setAlpha(90)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(halo))
-                painter.drawEllipse(point, radius + 6, radius + 6)
+            radius = 9.5 if selected else (8.5 if hovered else 7.5)
 
-            painter.setPen(QPen(QColor("#ffffff"), 2 if selected else 1))
-            painter.setBrush(QBrush(color))
+            halo = QRadialGradient(point, radius + 14)
+            halo_color = QColor(color)
+            halo_color.setAlpha(150 if selected else (90 if hovered else 0))
+            halo.setColorAt(0.0, halo_color)
+            halo.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(halo))
+            painter.drawEllipse(point, radius + 14, radius + 14)
+
+            painter.setPen(QPen(QColor(0, 0, 0, 70), 1))
+            painter.setBrush(QBrush(QColor("#ffffff")))
             painter.drawEllipse(point, radius, radius)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(point, radius - 2.8, radius - 2.8)
 
-            painter.setPen(QPen(QColor("#111827"), 1))
-            painter.drawText(
-                QRectF(point.x() - 16, point.y() - 8, 32, 16),
-                Qt.AlignmentFlag.AlignCenter,
-                self._target_dot_label(rule.target),
-            )
+            if selected or hovered:
+                painter.setPen(QPen(QColor("#ffffff"), 1))
+                dot_font = QFont(painter.font())
+                dot_font.setPointSizeF(max(6.5, dot_font.pointSizeF() - 1.5))
+                dot_font.setBold(True)
+                painter.setFont(dot_font)
+                painter.drawText(
+                    QRectF(point.x() - 16, point.y() - 8, 32, 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    self._target_dot_label(rule.target),
+                )
+                dot_font.setBold(False)
+                dot_font.setPointSizeF(dot_font.pointSizeF() + 1.5)
+                painter.setFont(dot_font)
 
         if 0 <= self._selected_index < len(self._rules):
             self._draw_selected_callout(painter, plot, self._selected_index)
@@ -1163,67 +1268,62 @@ class ScheduleGraphWidget(QWidget):
         if point is None:
             return
         text = (
-            f"{self._target_short_label(rule.target)} "
-            f"{_format_time_from_minutes(self._rule_minutes(rule))} "
+            f"{self._target_short_label(rule.target)} · "
+            f"{_format_time_from_minutes(self._rule_minutes(rule))} · "
             f"{clamp_brightness(rule.brightness)}%"
         )
-        width = min(max(118, painter.fontMetrics().horizontalAdvance(text) + 24), int(plot.width()))
-        height = 24
+        width = min(max(118, painter.fontMetrics().horizontalAdvance(text) + 26), int(plot.width()))
+        height = 26
         x_pos = min(max(plot.left(), point.x() - width / 2), plot.right() - width)
-        y_pos = point.y() - height - 16
+        y_pos = point.y() - height - 18
         if y_pos < plot.top() + 4:
-            y_pos = point.y() + 16
+            y_pos = point.y() + 18
         rect = QRectF(x_pos, y_pos, width, height)
-        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
-        painter.setBrush(QBrush(QColor(17, 24, 39, 210)))
-        painter.drawRoundedRect(rect, 6, 6)
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+        painter.setBrush(QBrush(QColor(12, 16, 28, 220)))
+        painter.drawRoundedRect(rect, 13, 13)
         painter.setPen(QPen(QColor("#f8fafc"), 1))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_legend(self, painter: QPainter, plot: QRectF) -> None:
         entries = (("display1", "Display 1"), ("display2", "Display 2"), ("both", "Both"))
-        x_pos = max(plot.left(), plot.right() - 230)
-        y_pos = 8
-        text_color = self._panel_text_color()
-        painter.setPen(QPen(text_color, 1))
+        x_pos = max(plot.left(), plot.right() - 232)
+        y_pos = 9
+        text_color = QColor(active_theme().muted)
         for target, label in entries:
             color = self._target_color(target)
             painter.setBrush(QBrush(color))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(x_pos, y_pos + 7), 5, 5)
+            painter.drawEllipse(QPointF(x_pos, y_pos + 7), 4.5, 4.5)
             painter.setPen(QPen(text_color, 1))
             painter.drawText(
                 QRectF(x_pos + 10, y_pos - 1, 74, 16),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 label,
             )
-            x_pos += 76
+            x_pos += 78
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         del event
+        theme = active_theme()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        base_font = QFont("Segoe UI")
-        base_font.setPointSize(8)
+        base_font = QFont(self.font())
+        base_font.setPointSizeF(8.0)
         painter.setFont(base_font)
 
         outer_rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
-        panel_color = QColor(self.palette().window().color())
-        if panel_color.lightness() < 90:
-            border_color = QColor(255, 255, 255, 38)
-        else:
-            border_color = QColor(15, 23, 42, 42)
-        painter.setPen(QPen(border_color, 1))
-        painter.setBrush(QBrush(panel_color))
-        painter.drawRoundedRect(outer_rect, 8, 8)
+        painter.setPen(QPen(qcolor(theme.card_border), 1))
+        painter.setBrush(QBrush(qcolor(theme.field)))
+        painter.drawRoundedRect(outer_rect, 14, 14)
 
         plot = self._plot_rect()
         self._draw_sky(painter, plot)
-        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(plot, 7, 7)
+        painter.drawRoundedRect(plot, 12, 12)
         self._draw_axes(painter, plot)
-        self._draw_moon_icon(painter, QPointF(plot.left() + 22, plot.top() + 22), QColor("#101827"))
+        self._draw_moon_icon(painter, QPointF(plot.left() + 22, plot.top() + 22), QColor("#0f1630"))
         self._draw_event_marker(
             painter,
             plot,
@@ -1238,11 +1338,12 @@ class ScheduleGraphWidget(QWidget):
             QColor("#fecdd3"),
             "Sunset",
         )
-        self._draw_interpolation_path(painter, plot, {"both", "display1"}, self._target_color("display1"))
-        self._draw_interpolation_path(painter, plot, {"both", "display2"}, self._target_color("display2"))
+        self._draw_interpolation_path(painter, plot, "display1", self._target_color("display1"))
+        self._draw_interpolation_path(painter, plot, "display2", self._target_color("display2"))
         self._draw_now_marker(painter, plot)
         self._draw_points(painter, plot)
         self._draw_legend(painter, plot)
+        painter.end()
 
     def _summary_for_rule(self, index: int) -> str:
         if index < 0 or index >= len(self._rules):
@@ -1269,13 +1370,13 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Brightness Tray Settings")
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setMinimumWidth(760)
+        self.setWindowTitle("Remote Monitor Controller Settings")
+        self.setMinimumWidth(780)
         _apply_rounded_popup_chrome(self, "settingsDialog")
 
         self._source_config = deepcopy(current_config)
         self._initial_theme = normalize_theme_name(current_config.theme)
+        self._initial_blur = bool(current_config.blur_enabled)
         self._selected_theme = self._initial_theme
         self.updated_config: AppConfig | None = None
         self.monitor_labels = monitor_labels or []
@@ -1291,30 +1392,34 @@ class SettingsDialog(QDialog):
         self._schedule_undo_stack: list[tuple[list[ScheduleRule], int, bool, bool]] = []
 
         root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 14)
+        root_layout.setSpacing(8)
+        self.title_bar = GlassTitleBar("Settings", self.reject)
+        root_layout.addWidget(self.title_bar)
+
         self.content_scroll = QScrollArea()
         self.content_scroll.setObjectName("settingsContentScroll")
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        root_layout.addWidget(self.content_scroll, stretch=1)
+        scroll_row = QHBoxLayout()
+        scroll_row.setContentsMargins(16, 0, 8, 0)
+        scroll_row.addWidget(self.content_scroll)
+        root_layout.addLayout(scroll_row, stretch=1)
 
         self.content_widget = QWidget()
         self.content_widget.setObjectName("settingsContentWidget")
         content_layout = QVBoxLayout(self.content_widget)
-        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setContentsMargins(0, 0, 8, 0)
+        content_layout.setSpacing(4)
 
         appearance_box = QGroupBox("Appearance")
         appearance_layout = QHBoxLayout(appearance_box)
+        appearance_layout.setSpacing(10)
         self.theme_button_group = QButtonGroup(self)
         self.theme_button_group.setExclusive(True)
         self.theme_buttons: dict[str, QPushButton] = {}
-        for label, theme_name in (
-            ("Light", THEME_LIGHT),
-            ("Dark", THEME_DARK),
-            ("Gray", THEME_GRAY),
-            ("Sand", THEME_SAND),
-        ):
-            button = QPushButton(label)
-            button.setCheckable(True)
+        for theme_name in THEME_OPTIONS:
+            button = ThemeSwatchButton(theme_name)
             self.theme_button_group.addButton(button)
             self.theme_buttons[theme_name] = button
             button.toggled.connect(
@@ -1327,10 +1432,16 @@ class SettingsDialog(QDialog):
         appearance_layout.addStretch(1)
         content_layout.addWidget(appearance_box)
 
-        startup_box = QGroupBox("Startup")
+        startup_box = QGroupBox("General")
         startup_layout = QVBoxLayout(startup_box)
-        self.startup_checkbox = QCheckBox("Launch app automatically when Windows starts")
+        startup_layout.setSpacing(8)
+        self.startup_checkbox = QCheckBox("Launch automatically when Windows starts")
         startup_layout.addWidget(self.startup_checkbox)
+        self.blur_checkbox = QCheckBox("Frosted blur behind windows (Windows 11)")
+        self.blur_checkbox.setToolTip(
+            "Uses the Windows acrylic backdrop. Turn off if the windows look wrong on your system."
+        )
+        startup_layout.addWidget(self.blur_checkbox)
         content_layout.addWidget(startup_box)
 
         picture_controls_box = QGroupBox("Display Picture Controls")
@@ -1340,6 +1451,7 @@ class SettingsDialog(QDialog):
             "black level, and color controls) detected through DDC/CI."
         )
         self.picture_controls_help_label.setWordWrap(True)
+        self.picture_controls_help_label.setObjectName("muted")
         picture_controls_layout.addWidget(self.picture_controls_help_label)
         picture_controls_row = QHBoxLayout()
         self.picture_controls_button = QPushButton("Open Picture Controls")
@@ -1389,6 +1501,32 @@ class SettingsDialog(QDialog):
             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
         )
         schedule_layout.addLayout(schedule_top_layout)
+
+        location_row = QHBoxLayout()
+        location_row.setSpacing(8)
+        self.auto_location_checkbox = QCheckBox("Detect my location automatically")
+        location_row.addWidget(self.auto_location_checkbox)
+        location_row.addStretch(1)
+        self.latitude_spin = QDoubleSpinBox()
+        self.latitude_spin.setRange(-90.0, 90.0)
+        self.latitude_spin.setDecimals(4)
+        self.latitude_spin.setSuffix("° N")
+        self.latitude_spin.setMinimumWidth(112)
+        self.longitude_spin = QDoubleSpinBox()
+        self.longitude_spin.setRange(-180.0, 180.0)
+        self.longitude_spin.setDecimals(4)
+        self.longitude_spin.setSuffix("° E")
+        self.longitude_spin.setMinimumWidth(118)
+        location_row.addWidget(QLabel("Latitude"))
+        location_row.addWidget(self.latitude_spin)
+        location_row.addWidget(QLabel("Longitude"))
+        location_row.addWidget(self.longitude_spin)
+        self.detect_location_button = QPushButton("Detect now")
+        location_row.addWidget(self.detect_location_button)
+        schedule_layout.addLayout(location_row)
+        self.location_hint_label = QLabel("")
+        self.location_hint_label.setObjectName("hint")
+        schedule_layout.addWidget(self.location_hint_label)
 
         self.schedule_graph = ScheduleGraphWidget(self._build_target_choices())
         schedule_layout.addWidget(self.schedule_graph)
@@ -1471,12 +1609,25 @@ class SettingsDialog(QDialog):
         )
         button_box.accepted.connect(self._save_and_close)
         button_box.rejected.connect(self.reject)
-        root_layout.addWidget(button_box)
+        save_button = button_box.button(QDialogButtonBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setObjectName("primary")
+            save_button.setText("Save changes")
+            save_button.setDefault(True)
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(16, 0, 16, 0)
+        footer_row.addWidget(button_box)
+        root_layout.addLayout(footer_row)
         self.button_box = button_box
 
         self.picture_controls_button.clicked.connect(
             lambda _checked=False: self._open_picture_controls_dialog()
         )
+        self.blur_checkbox.toggled.connect(self._handle_blur_toggled)
+        self.auto_location_checkbox.toggled.connect(self._handle_auto_location_toggled)
+        self.latitude_spin.valueChanged.connect(lambda _v: self._handle_manual_location_changed())
+        self.longitude_spin.valueChanged.connect(lambda _v: self._handle_manual_location_changed())
+        self.detect_location_button.clicked.connect(lambda _checked=False: self._detect_location_now())
         self.schedule_enabled_checkbox.toggled.connect(self._handle_schedule_enabled_toggled)
         self.gradual_checkbox.toggled.connect(self._handle_gradual_toggled)
         self.schedule_graph.edit_started.connect(self._remember_schedule_state)
@@ -1541,6 +1692,17 @@ class SettingsDialog(QDialog):
     def _load_from_config(self) -> None:
         self._set_selected_theme(normalize_theme_name(self._source_config.theme), preview=False)
         self.startup_checkbox.setChecked(self._source_config.startup_enabled)
+        self.blur_checkbox.setChecked(self._source_config.blur_enabled)
+        schedule_settings = self._source_config.schedule
+        self.auto_location_checkbox.setChecked(schedule_settings.auto_location)
+        for spin, value in (
+            (self.latitude_spin, schedule_settings.latitude),
+            (self.longitude_spin, schedule_settings.longitude),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value) if value is not None else 0.0)
+            spin.blockSignals(False)
+        self._update_location_controls()
         self.schedule_enabled_checkbox.setChecked(self._source_config.schedule.enabled)
         self.gradual_checkbox.setChecked(self._source_config.schedule.gradual)
         controls_available = self.brightness_service is not None and bool(self.monitor_handles)
@@ -1557,6 +1719,67 @@ class SettingsDialog(QDialog):
         self._refresh_default_rules_button_state()
         self._update_schedule_controls_visibility(self.schedule_enabled_checkbox.isChecked())
         self._refresh_dialog_size()
+
+    def _handle_blur_toggled(self, checked: bool) -> None:
+        set_blur_enabled(checked)
+        apply_backdrop(self)
+        parent = self.parentWidget()
+        if parent is not None:
+            apply_backdrop(parent)
+
+    def _update_location_controls(self) -> None:
+        auto = self.auto_location_checkbox.isChecked()
+        self.latitude_spin.setEnabled(not auto)
+        self.longitude_spin.setEnabled(not auto)
+        self.detect_location_button.setVisible(auto)
+        if auto:
+            if self._detected_location is not None:
+                self.location_hint_label.setText(f"Detected: {self._detected_location.region}")
+            elif self._source_config.schedule.latitude is not None:
+                self.location_hint_label.setText("Using your last detected location.")
+            else:
+                self.location_hint_label.setText("Location will be detected from your IP address.")
+        else:
+            self.location_hint_label.setText("Enter your coordinates manually (decimal degrees).")
+
+    def _handle_auto_location_toggled(self, _checked: bool) -> None:
+        self._update_location_controls()
+        if not self.auto_location_checkbox.isChecked():
+            self._handle_manual_location_changed()
+        self._refresh_dialog_size()
+
+    def _handle_manual_location_changed(self) -> None:
+        if self.auto_location_checkbox.isChecked():
+            return
+        self._source_config.schedule.latitude = self.latitude_spin.value()
+        self._source_config.schedule.longitude = self.longitude_spin.value()
+        self._sun_times_cache_key = None
+        self._update_location_time_label()
+
+    def _detect_location_now(self) -> None:
+        self.detect_location_button.setEnabled(False)
+        self.location_hint_label.setText("Detecting location…")
+
+        def finished(result, error) -> None:
+            self.detect_location_button.setEnabled(True)
+            if error is not None or result is None:
+                self.location_hint_label.setText(
+                    "Could not detect your location. Turn off auto-detect to enter it manually."
+                )
+                return
+            self._detected_location = result
+            self._location_timezone_name = result.timezone_name or self._location_timezone_name
+            self._source_config.schedule.latitude = result.latitude
+            self._source_config.schedule.longitude = result.longitude
+            for spin, value in ((self.latitude_spin, result.latitude), (self.longitude_spin, result.longitude)):
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+            self._sun_times_cache_key = None
+            self._update_location_controls()
+            self._update_location_time_label()
+
+        run_async(self, detect_location_context_from_ip, finished)
 
     def _handle_schedule_enabled_toggled(self, checked: bool) -> None:
         snapshot = self._schedule_snapshot(schedule_enabled=not checked)
@@ -1746,7 +1969,13 @@ class SettingsDialog(QDialog):
         layout_spacing = max(0, layout.spacing())
         button_height = self.button_box.sizeHint().height()
 
-        static_height = margins.top() + margins.bottom() + layout_spacing + button_height
+        static_height = (
+            margins.top()
+            + margins.bottom()
+            + self.title_bar.height()
+            + (layout_spacing * 2)
+            + button_height
+        )
         preferred_height = static_height + content_size.height()
         max_height = self._max_dialog_height()
         max_content_height = max(160, max_height - static_height)
@@ -1755,7 +1984,7 @@ class SettingsDialog(QDialog):
         target_height = static_height + content_height
 
         self.content_scroll.setFixedHeight(content_height)
-        target_width = max(self.minimumWidth(), content_size.width() + margins.left() + margins.right())
+        target_width = max(self.minimumWidth(), content_size.width() + 40)
         if needs_scroll:
             scrollbar_width = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
             target_width += max(0, scrollbar_width)
@@ -2220,6 +2449,18 @@ class SettingsDialog(QDialog):
         if error:
             QMessageBox.warning(self, "Invalid Rule", error)
             return
+        if (
+            not self.auto_location_checkbox.isChecked()
+            and self.latitude_spin.value() == 0.0
+            and self.longitude_spin.value() == 0.0
+            and any(rule.anchor in ("sunrise", "sunset") for rule in rules)
+        ):
+            QMessageBox.warning(
+                self,
+                "Location Needed",
+                "Enter your latitude and longitude, or turn on automatic location detection.",
+            )
+            return
         if self.schedule_enabled_checkbox.isChecked() and not rules:
             QMessageBox.warning(
                 self,
@@ -2231,12 +2472,17 @@ class SettingsDialog(QDialog):
         updated = deepcopy(self._source_config)
         updated.theme = self._selected_theme
         updated.startup_enabled = self.startup_checkbox.isChecked()
+        updated.blur_enabled = self.blur_checkbox.isChecked()
         updated.schedule.enabled = self.schedule_enabled_checkbox.isChecked()
         updated.schedule.gradual = self.gradual_checkbox.isChecked()
-        updated.schedule.auto_location = True
-        if self._detected_location is not None:
-            updated.schedule.latitude = self._detected_location.latitude
-            updated.schedule.longitude = self._detected_location.longitude
+        updated.schedule.auto_location = self.auto_location_checkbox.isChecked()
+        if updated.schedule.auto_location:
+            if self._detected_location is not None:
+                updated.schedule.latitude = self._detected_location.latitude
+                updated.schedule.longitude = self._detected_location.longitude
+        else:
+            updated.schedule.latitude = self.latitude_spin.value()
+            updated.schedule.longitude = self.longitude_spin.value()
         updated.schedule.rules = rules or default_schedule_rules()
 
         self.updated_config = updated
@@ -2258,19 +2504,28 @@ class SettingsDialog(QDialog):
             button.setChecked(should_check)
             button.blockSignals(False)
         if preview:
-            app = QApplication.instance()
-            if app is not None:
-                app.setStyleSheet(build_stylesheet(normalized_theme))
+            apply_app_theme(normalized_theme)
 
     def reject(self) -> None:  # type: ignore[override]
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(build_stylesheet(self._initial_theme))
+        apply_app_theme(self._initial_theme)
+        if self.blur_checkbox.isChecked() != self._initial_blur:
+            set_blur_enabled(self._initial_blur)
+            parent = self.parentWidget()
+            if parent is not None:
+                apply_backdrop(parent)
         super().reject()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        paint_glass(self, painter)
+        painter.end()
 
 
 class BrightnessControlWindow(QWidget):
     settings_changed = Signal(object)
+    write_failed = Signal(str)
+    write_recovered = Signal(str)
     _AMBIENT_TIMER_INTERVAL_MS = 1_100
     _AMBIENT_APPLY_DEADBAND = 2
     _AMBIENT_MAX_STEP = 4
@@ -2289,10 +2544,10 @@ class BrightnessControlWindow(QWidget):
         self.config_store = config_store
         self.config = config
 
-        self.setWindowTitle("Brightness Tray")
+        self.setWindowTitle("Remote Monitor Controller")
         self.setWindowFlag(Qt.WindowType.Popup, True)
-        self.setMinimumWidth(420)
-        self.resize(440, 260)
+        self.setMinimumWidth(400)
+        self.resize(420, 260)
         _apply_rounded_popup_chrome(self, "brightnessControlPopup")
 
         self._internal_ui_update = False
@@ -2304,69 +2559,113 @@ class BrightnessControlWindow(QWidget):
         self._last_ambient_applied: int | None = None
         self._last_ambient_persist_ts = 0.0
         self._last_popup_hide_monotonic = 0.0
+        self._refresh_in_flight = False
+        self._ambient_probe_in_flight = False
+
+        self._writer = BrightnessWriter(
+            service,
+            on_failure=self.write_failed.emit,
+            on_success=self.write_recovered.emit,
+        )
+        self.write_failed.connect(self._handle_write_failed)
+        self.write_recovered.connect(self._handle_write_recovered)
+
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setSingleShot(True)
+        self._persist_timer.setInterval(350)
+        self._persist_timer.timeout.connect(self._persist_config)
 
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setContentsMargins(18, 14, 18, 16)
+        root_layout.setSpacing(12)
 
-        self.info_label = QLabel("")
-        self.info_label.setWordWrap(True)
-        root_layout.addWidget(self.info_label)
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        self.header_glyph = QLabel()
+        self.header_glyph.setPixmap(app_glyph_pixmap(44))
+        self.header_glyph.setScaledContents(True)
+        self.header_glyph.setFixedSize(24, 24)
+        header_row.addWidget(self.header_glyph)
+        self.title_label = QLabel("Remote Monitor Controller")
+        self.title_label.setObjectName("windowTitle")
+        header_row.addWidget(self.title_label)
+        header_row.addStretch(1)
+        self.refresh_button = _flat_tool_button("refresh", "Refresh monitors")
+        self.settings_button = _flat_tool_button("settings", "Settings")
+        header_row.addWidget(self.refresh_button)
+        header_row.addWidget(self.settings_button)
+        root_layout.addLayout(header_row)
 
         control_row = QHBoxLayout()
+        control_row.setSpacing(8)
         self.link_button = QPushButton("Unlinked")
+        self.link_button.setObjectName("pill")
         self.link_button.setCheckable(True)
-        self.link_button.setMinimumWidth(92)
+        self.link_button.setMinimumWidth(96)
+        self.link_button.setCursor(Qt.CursorShape.PointingHandCursor)
         control_row.addWidget(self.link_button)
         self.ambient_button = QPushButton("Auto Light")
+        self.ambient_button.setObjectName("pill")
         self.ambient_button.setCheckable(True)
-        self.ambient_button.setMinimumWidth(96)
+        self.ambient_button.setMinimumWidth(100)
+        self.ambient_button.setCursor(Qt.CursorShape.PointingHandCursor)
         control_row.addWidget(self.ambient_button)
         control_row.addStretch(1)
-        self.refresh_button = QToolButton()
-        self.refresh_button.setIcon(self._load_refresh_icon())
-        self.refresh_button.setIconSize(QSize(18, 18))
-        self.refresh_button.setToolTip("Refresh monitors")
-        self.settings_button = QToolButton()
-        self.settings_button.setIcon(self._build_settings_icon())
-        self.settings_button.setIconSize(QSize(18, 18))
-        self.settings_button.setToolTip("Settings")
-        control_row.addWidget(self.refresh_button)
-        control_row.addWidget(self.settings_button)
+        self.status_chip = QLabel("")
+        self.status_chip.setObjectName("statusChip")
+        self.status_chip.setVisible(False)
+        control_row.addWidget(self.status_chip)
         root_layout.addLayout(control_row)
 
-        self.combined_group = QGroupBox("Combined Brightness")
-        combined_layout = QHBoxLayout(self.combined_group)
+        self.combined_group = QFrame()
+        self.combined_group.setObjectName("card")
+        combined_layout = QVBoxLayout(self.combined_group)
+        combined_layout.setContentsMargins(16, 12, 16, 12)
+        combined_layout.setSpacing(0)
+        combined_header = QHBoxLayout()
         self.combined_label = QLabel("All displays")
-        self.global_slider = QSlider(Qt.Orientation.Horizontal)
-        self.global_slider.setRange(0, 100)
-        _apply_brightness_slider_style(self.global_slider, self.config.last_global_brightness)
+        self.combined_label.setObjectName("muted")
+        combined_header.addWidget(self.combined_label)
+        combined_header.addStretch(1)
         self.global_value_label = QLabel("0%")
-        self.global_value_label.setMinimumWidth(40)
+        self.global_value_label.setObjectName("bigValue")
+        self.global_value_label.setMinimumWidth(86)
         self.global_value_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self.global_value_label.setStyleSheet(
-            _brightness_value_label_style(self.config.last_global_brightness)
+            _big_value_style(self.config.last_global_brightness)
         )
-        combined_layout.addWidget(self.combined_label)
-        combined_layout.addWidget(self.global_slider, stretch=1)
-        combined_layout.addWidget(self.global_value_label)
+        combined_header.addWidget(self.global_value_label)
+        combined_layout.addLayout(combined_header)
+        self.global_slider = GlowSlider(Qt.Orientation.Horizontal, brightness_scale=True)
+        self.global_slider.setRange(0, 100)
+        combined_layout.addWidget(self.global_slider)
         root_layout.addWidget(self.combined_group)
 
-        self.monitors_group = QGroupBox("Per-Monitor Brightness")
+        self.monitors_group = QFrame()
+        self.monitors_group.setObjectName("card")
         monitors_layout = QVBoxLayout(self.monitors_group)
+        monitors_layout.setContentsMargins(14, 12, 10, 12)
         self.monitor_scroll = QScrollArea()
         self.monitor_scroll.setObjectName("monitorScroll")
         self.monitor_scroll.setWidgetResizable(True)
         self.monitor_scroll.setMinimumHeight(1)
+        self.monitor_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.monitor_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.monitor_scroll_content = QWidget()
         self.monitor_scroll_content.setObjectName("monitorScrollContent")
         self.monitor_rows_layout = QVBoxLayout(self.monitor_scroll_content)
-        self.monitor_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.monitor_rows_layout.setSpacing(8)
+        self.monitor_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.monitor_rows_layout.setSpacing(12)
         self.monitor_scroll.setWidget(self.monitor_scroll_content)
         monitors_layout.addWidget(self.monitor_scroll)
         root_layout.addWidget(self.monitors_group)
+
+        self.info_label = QLabel("")
+        self.info_label.setObjectName("hint")
+        self.info_label.setWordWrap(True)
+        root_layout.addWidget(self.info_label)
 
         self.refresh_button.clicked.connect(lambda _checked=False: self._handle_refresh_button())
         self.settings_button.clicked.connect(lambda _checked=False: self._open_settings_dialog())
@@ -2395,6 +2694,7 @@ class BrightnessControlWindow(QWidget):
         _apply_native_rounded_corners(self)
         self.raise_()
         self.activateWindow()
+        animate_in(self, _slide_offset_for(self))
         self._last_popup_hide_monotonic = 0.0
 
     def has_open_popups(self) -> bool:
@@ -2437,7 +2737,7 @@ class BrightnessControlWindow(QWidget):
         self.layout().activate()
         self.adjustSize()
         preferred_size = self.sizeHint()
-        width = max(420, min(560, preferred_size.width()))
+        width = max(400, min(520, preferred_size.width()))
         compact_layout = self._is_link_mode_effective() or len(self.monitor_rows) <= 1
         min_height = 118 if compact_layout else 160
         height = max(min_height, min(640, preferred_size.height()))
@@ -2460,15 +2760,57 @@ class BrightnessControlWindow(QWidget):
         self.move(target_x, target_y)
 
     def refresh_monitors(self, apply_saved: bool) -> None:
+        """Blocking refresh (used once at startup). Prefer ``refresh_monitors_async``."""
         try:
             monitors = self.service.refresh_monitors()
+            readings = [(monitor, self.service.get_brightness(monitor)) for monitor in monitors]
         except Exception as error:
             self.info_label.setText(f"Could not access monitors: {error}")
-            monitors = []
+            readings = []
+        self._rebuild_rows(readings, apply_saved)
 
+    def refresh_monitors_async(self) -> None:
+        """Re-detect displays off the GUI thread so opening the popup never stutters."""
+        if self._refresh_in_flight:
+            return
+        self._refresh_in_flight = True
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setToolTip("Refreshing…")
+
+        def work():
+            with com_initialized():
+                monitors = self.service.refresh_monitors()
+                return [(monitor, self.service.get_brightness(monitor)) for monitor in monitors]
+
+        run_async(self, work, self._finish_refresh)
+
+    def _finish_refresh(self, readings, error) -> None:
+        self._refresh_in_flight = False
+        self.refresh_button.setEnabled(True)
+        self.refresh_button.setToolTip("Refresh monitors")
+        if error is not None:
+            self.info_label.setText(f"Could not access monitors: {error}")
+            return
+
+        known_keys = [row.monitor.key for row in self.monitor_rows]
+        fresh_keys = [monitor.key for monitor, _level in readings]
+        if known_keys and known_keys == fresh_keys:
+            for row, (_monitor, level) in zip(self.monitor_rows, readings):
+                if level is None or row.slider.isSliderDown():
+                    continue
+                row.set_value(level)
+            self.info_label.setText(f"Detected {len(readings)} display(s).")
+            self._sync_global_slider_to_average()
+        else:
+            self._rebuild_rows(readings, apply_saved=False)
+            return
+        if self.config.ambient_auto_enabled:
+            self._handle_ambient_timer_tick()
+
+    def _rebuild_rows(self, readings, apply_saved: bool) -> None:
         self._clear_monitor_rows()
 
-        if not monitors:
+        if not readings:
             self.info_label.setText(
                 "No compatible displays detected. "
                 "Enable DDC/CI in your monitor settings if needed."
@@ -2477,10 +2819,9 @@ class BrightnessControlWindow(QWidget):
             self._refresh_visible_popup_geometry()
             return
 
-        self.info_label.setText(f"Detected {len(monitors)} display(s).")
-        for monitor in monitors:
+        self.info_label.setText(f"Detected {len(readings)} display(s).")
+        for monitor, current_level in readings:
             saved_level = self.config.monitor_levels.get(monitor.key)
-            current_level = self.service.get_brightness(monitor)
             if apply_saved:
                 initial_level = saved_level if saved_level is not None else (
                     current_level if current_level is not None else self.config.last_global_brightness
@@ -2508,6 +2849,18 @@ class BrightnessControlWindow(QWidget):
         if self.config.ambient_auto_enabled:
             self._handle_ambient_timer_tick()
 
+    def _write_brightness(self, monitor: MonitorHandle, value: int) -> None:
+        self._writer.submit(monitor, value)
+
+    def _handle_write_failed(self, monitor_name: str) -> None:
+        self.info_label.setText(
+            f"Couldn't change brightness on {monitor_name}. Check that DDC/CI is enabled in its menu."
+        )
+
+    def _handle_write_recovered(self, monitor_name: str) -> None:
+        del monitor_name
+        self.info_label.setText(f"{len(self.monitor_rows)} display(s) connected.")
+
     def apply_saved_profile(self) -> None:
         if not self.monitor_rows:
             return
@@ -2520,14 +2873,14 @@ class BrightnessControlWindow(QWidget):
             level = self.config.monitor_levels.get(row.monitor.key)
             if level is None:
                 continue
-            self.service.set_brightness(row.monitor, level)
+            self._write_brightness(row.monitor, level)
             row.set_value(level)
         self._sync_global_slider_to_average()
 
     def apply_brightness_to_all(self, value: int, persist: bool = True) -> None:
         bounded = clamp_brightness(value)
         for row in self.monitor_rows:
-            self.service.set_brightness(row.monitor, bounded)
+            self._write_brightness(row.monitor, bounded)
             row.set_value(bounded)
 
         self._set_global_slider_value(bounded)
@@ -2535,7 +2888,7 @@ class BrightnessControlWindow(QWidget):
             self.config.last_global_brightness = bounded
             for row in self.monitor_rows:
                 self.config.monitor_levels[row.monitor.key] = bounded
-            self._persist_config()
+            self._persist_config_soon()
 
     def apply_brightness_map(self, values: dict[str, int], persist: bool = True) -> None:
         applied: list[int] = []
@@ -2543,7 +2896,7 @@ class BrightnessControlWindow(QWidget):
             if row.monitor.key not in values:
                 continue
             level = clamp_brightness(values[row.monitor.key])
-            self.service.set_brightness(row.monitor, level)
+            self._write_brightness(row.monitor, level)
             row.set_value(level)
             self.config.monitor_levels[row.monitor.key] = level
             applied.append(level)
@@ -2561,7 +2914,22 @@ class BrightnessControlWindow(QWidget):
         self.apply_brightness_map(targets, persist=persist)
 
     def set_schedule_status(self, text: str) -> None:
+        if text == self._schedule_status_text:
+            return
         self._schedule_status_text = text
+        show_chip = bool(text) and text != "Schedule: off"
+        chip_text = ""
+        if show_chip:
+            body = text.replace("Schedule: ", "", 1).rstrip(".")
+            body = body[:1].upper() + body[1:]
+            chip_text = QFontMetrics(self.status_chip.font()).elidedText(
+                f"◷  {body}", Qt.TextElideMode.ElideRight, 250
+            )
+        self.status_chip.setText(chip_text)
+        self.status_chip.setToolTip(text)
+        if self.status_chip.isVisible() != show_chip:
+            self.status_chip.setVisible(show_chip)
+        self._refresh_visible_popup_geometry()
 
     def set_link_mode(
         self, linked: bool, persist: bool = True, apply_link_brightness: bool = True
@@ -2580,84 +2948,34 @@ class BrightnessControlWindow(QWidget):
             self._persist_config()
 
     def _load_refresh_icon(self) -> QIcon:
-        if REFRESH_ICON_PATH is not None:
-            source = QPixmap(str(REFRESH_ICON_PATH))
-            if source.isNull():
-                return QIcon(str(REFRESH_ICON_PATH))
-            if normalize_theme_name(self.config.theme) == THEME_DARK:
-                tinted = QPixmap(source.size())
-                tinted.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(tinted)
-                painter.drawPixmap(0, 0, source)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-                painter.fillRect(tinted.rect(), QColor(255, 255, 255))
-                painter.end()
-                return QIcon(tinted)
-            return QIcon(source)
-        return self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        return glyph_icon("refresh", active_theme().fg)
 
     def _build_settings_icon(self) -> QIcon:
-        if SETTINGS_ICON_PATH is not None:
-            source = QPixmap(str(SETTINGS_ICON_PATH))
-            if source.isNull():
-                return QIcon(str(SETTINGS_ICON_PATH))
-            if normalize_theme_name(self.config.theme) == THEME_DARK:
-                tinted = QPixmap(source.size())
-                tinted.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(tinted)
-                painter.drawPixmap(0, 0, source)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-                painter.fillRect(tinted.rect(), QColor(255, 255, 255))
-                painter.end()
-                return QIcon(tinted)
-            return QIcon(source)
-
-        size = 18
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        if normalize_theme_name(self.config.theme) == THEME_DARK:
-            bar_color = QColor(255, 255, 255)
-        else:
-            palette = self.palette()
-            bar_color = QColor(palette.buttonText().color())
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        track_left = 3.0
-        track_right = 15.0
-        line_ys = (5.0, 9.0, 13.0)
-        knob_offsets = (-2.0, 2.0, -2.0)
-        center_x = (track_left + track_right) / 2.0
-        knob_radius = 1.7
-
-        line_pen = QPen(bar_color, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        painter.setPen(line_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for y in line_ys:
-            painter.drawLine(QPointF(track_left, y), QPointF(track_right, y))
-
-        painter.setPen(QPen(bar_color, 1.0))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for y, offset in zip(line_ys, knob_offsets):
-            painter.drawEllipse(QPointF(center_x + offset, y), knob_radius, knob_radius)
-
-        painter.end()
-        return QIcon(pixmap)
+        return glyph_icon("settings", active_theme().fg)
 
     def _refresh_toolbar_icons(self) -> None:
         self.refresh_button.setIcon(self._load_refresh_icon())
         self.settings_button.setIcon(self._build_settings_icon())
 
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.StyleChange and hasattr(self, "settings_button"):
+            self._refresh_toolbar_icons()
+        return super().event(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        paint_glass(self, painter)
+        painter.end()
+
     def _handle_refresh_button(self) -> None:
-        self.refresh_monitors(apply_saved=False)
+        self.refresh_monitors_async()
 
     def _handle_global_slider_change(self, value: int) -> None:
         bounded = clamp_brightness(value)
         _apply_brightness_slider_style(self.global_slider, bounded)
         self.global_value_label.setText(f"{bounded}%")
-        self.global_value_label.setStyleSheet(_brightness_value_label_style(bounded))
+        self.global_value_label.setStyleSheet(_big_value_style(bounded))
         if self._internal_ui_update:
             return
         if not self.config.link_mode:
@@ -2675,37 +2993,60 @@ class BrightnessControlWindow(QWidget):
         self._set_ambient_enabled(checked, persist=True)
 
     def _set_ambient_enabled(self, enabled: bool, persist: bool) -> None:
-        target_enabled = bool(enabled)
-        if target_enabled:
-            detected_lux = self._ambient_service.probe_sensor()
-            if detected_lux is None:
-                self.config.ambient_auto_enabled = False
-                self._internal_ui_update = True
-                self.ambient_button.setChecked(False)
-                self._internal_ui_update = False
-                self.info_label.setText(
-                    "Ambient light sensor is unavailable. Auto Light was not enabled."
-                )
-                self._update_link_mode_ui()
-                if persist:
-                    self._persist_config()
-                return
+        if enabled:
+            self._begin_ambient_enable(persist)
+            return
 
-            self.config.ambient_auto_enabled = True
-            self._ambient_smoothed_target = None
-            self._last_ambient_applied = None
-            self._last_ambient_persist_ts = 0.0
-            self._ambient_service.start()
-            self._ambient_timer.start()
-            self._handle_ambient_timer_tick()
-        else:
+        self.config.ambient_auto_enabled = False
+        self._ambient_timer.stop()
+        self._ambient_service.stop()
+        self._ambient_smoothed_target = None
+        self._last_ambient_applied = None
+        self._last_ambient_persist_ts = 0.0
+        self._update_link_mode_ui()
+        if persist:
+            self._persist_config()
+
+    def _begin_ambient_enable(self, persist: bool) -> None:
+        """Probe the light sensor off the GUI thread (PowerShell can take a couple of seconds)."""
+        if self._ambient_probe_in_flight:
+            return
+        self._ambient_probe_in_flight = True
+        self.ambient_button.setEnabled(False)
+        self.ambient_button.setToolTip("Checking the ambient light sensor…")
+        run_async(
+            self,
+            self._ambient_service.probe_sensor,
+            lambda lux, error: self._finish_ambient_enable(lux, error, persist),
+        )
+
+    def _finish_ambient_enable(self, detected_lux, error, persist: bool) -> None:
+        self._ambient_probe_in_flight = False
+        self.ambient_button.setEnabled(True)
+        if error is not None or detected_lux is None:
             self.config.ambient_auto_enabled = False
-            self._ambient_timer.stop()
-            self._ambient_service.stop()
-            self._ambient_smoothed_target = None
-            self._last_ambient_applied = None
-            self._last_ambient_persist_ts = 0.0
+            self._internal_ui_update = True
+            self.ambient_button.setChecked(False)
+            self._internal_ui_update = False
+            self.info_label.setText(
+                "Ambient light sensor is unavailable. Auto Light was not enabled."
+            )
+            self._update_link_mode_ui()
+            if persist:
+                self._persist_config()
+            return
 
+        self.config.ambient_auto_enabled = True
+        if not self.ambient_button.isChecked():
+            self._internal_ui_update = True
+            self.ambient_button.setChecked(True)
+            self._internal_ui_update = False
+        self._ambient_smoothed_target = None
+        self._last_ambient_applied = None
+        self._last_ambient_persist_ts = 0.0
+        self._ambient_service.start()
+        self._ambient_timer.start()
+        self._handle_ambient_timer_tick()
         self._update_link_mode_ui()
         if persist:
             self._persist_config()
@@ -2746,7 +3087,7 @@ class BrightnessControlWindow(QWidget):
         for row in target_rows:
             if row.slider.value() == next_level:
                 continue
-            self.service.set_brightness(row.monitor, next_level)
+            self._write_brightness(row.monitor, next_level)
             row.set_value(next_level)
             self.config.monitor_levels[row.monitor.key] = next_level
             applied_any = True
@@ -2803,10 +3144,10 @@ class BrightnessControlWindow(QWidget):
         if target_row is None:
             return
 
-        self.service.set_brightness(target_row.monitor, value)
+        self._write_brightness(target_row.monitor, value)
         self.config.monitor_levels[monitor_key] = clamp_brightness(value)
         self._sync_global_slider_to_average()
-        self._persist_config()
+        self._persist_config_soon()
 
     def _sync_global_slider_to_average(self) -> None:
         if not self.monitor_rows:
@@ -2823,7 +3164,7 @@ class BrightnessControlWindow(QWidget):
         self.global_slider.setValue(bounded)
         _apply_brightness_slider_style(self.global_slider, bounded)
         self.global_value_label.setText(f"{bounded}%")
-        self.global_value_label.setStyleSheet(_brightness_value_label_style(bounded))
+        self.global_value_label.setStyleSheet(_big_value_style(bounded))
         self._internal_ui_update = False
 
     def _update_link_mode_ui(self) -> None:
@@ -2902,6 +3243,8 @@ class BrightnessControlWindow(QWidget):
             return
 
         self.config = dialog.updated_config
+        set_blur_enabled(self.config.blur_enabled)
+        apply_backdrop(self)
         self._refresh_toolbar_icons()
         self._set_global_slider_value(self.config.last_global_brightness)
         self.set_link_mode(
@@ -2912,7 +3255,17 @@ class BrightnessControlWindow(QWidget):
         self.settings_changed.emit(self.config)
 
     def _persist_config(self) -> None:
+        self._persist_timer.stop()
         self.config_store.save(self.config)
+
+    def _persist_config_soon(self) -> None:
+        """Coalesce rapid slider drags into a single disk write."""
+        self._persist_timer.start()
+
+    def flush_pending_save(self) -> None:
+        if self._persist_timer.isActive():
+            self._persist_config()
+        self._writer.stop()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.hide()
@@ -2920,4 +3273,6 @@ class BrightnessControlWindow(QWidget):
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._last_popup_hide_monotonic = wall_time.monotonic()
+        if self._persist_timer.isActive():
+            self._persist_config()
         super().hideEvent(event)

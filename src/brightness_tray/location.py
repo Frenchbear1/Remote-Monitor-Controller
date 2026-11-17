@@ -18,7 +18,7 @@ def detect_location_context_from_ip() -> LocationContext | None:
         return None
 
     try:
-        result = geocoder.ip("me")
+        result = geocoder.ip("me", timeout=5.0)
     except Exception:
         return None
 

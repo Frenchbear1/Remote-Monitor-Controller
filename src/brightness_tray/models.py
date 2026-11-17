@@ -51,4 +51,5 @@ class AppConfig:
     last_global_brightness: int = 100
     monitor_levels: dict[str, int] = field(default_factory=dict)
     startup_enabled: bool = True
+    blur_enabled: bool = True
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)

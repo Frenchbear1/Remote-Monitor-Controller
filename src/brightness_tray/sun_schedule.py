@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -11,9 +11,22 @@ from tzlocal import get_localzone_name
 from .models import ScheduleRule, ScheduleSettings, clamp_brightness
 
 
+def _resolve_timezone() -> tuple[str, tzinfo]:
+    """Best-effort local zone; never raises (tzlocal can return odd names on some systems)."""
+    try:
+        name = get_localzone_name()
+        if name:
+            return name, ZoneInfo(name)
+    except Exception:
+        pass
+    local = datetime.now().astimezone().tzinfo or timezone.utc
+    return "UTC", local
+
+
 class SunScheduleEngine:
     def __init__(self) -> None:
-        self.timezone_name = get_localzone_name()
+        self.timezone_name, self._timezone = _resolve_timezone()
+        self._sun_cache: dict[tuple[Any, float, float], dict[str, datetime] | None] = {}
 
     def target_brightness(
         self,
@@ -31,13 +44,13 @@ class SunScheduleEngine:
         if uses_sun_events and (schedule.latitude is None or schedule.longitude is None):
             return None
 
-        timezone = ZoneInfo(self.timezone_name)
+        local_zone = self._timezone
         if now is None:
-            current_time = datetime.now(timezone)
+            current_time = datetime.now(local_zone)
         elif now.tzinfo is None:
-            current_time = now.replace(tzinfo=timezone)
+            current_time = now.replace(tzinfo=local_zone)
         else:
-            current_time = now.astimezone(timezone)
+            current_time = now.astimezone(local_zone)
 
         points: list[tuple[datetime, int]] = []
         for day_offset in (-1, 0, 1):
@@ -47,7 +60,7 @@ class SunScheduleEngine:
                 if schedule.latitude is None or schedule.longitude is None:
                     continue
                 sun_events = self._get_sun_events(
-                    target_date, schedule.latitude, schedule.longitude, timezone
+                    target_date, schedule.latitude, schedule.longitude, local_zone
                 )
 
             for rule in active_rules:
@@ -55,7 +68,7 @@ class SunScheduleEngine:
                     parsed_time = self._parse_time(rule.specific_time)
                     if parsed_time is None:
                         continue
-                    anchor_time = datetime.combine(target_date, parsed_time, timezone)
+                    anchor_time = datetime.combine(target_date, parsed_time, local_zone)
                 else:
                     if not sun_events:
                         continue
@@ -89,7 +102,19 @@ class SunScheduleEngine:
         return self._interpolate(current_time, previous, following)
 
     def _get_sun_events(
-        self, target_date: Any, latitude: float, longitude: float, timezone: ZoneInfo
+        self, target_date: Any, latitude: float, longitude: float, zone: tzinfo
+    ) -> dict[str, datetime] | None:
+        cache_key = (target_date, round(float(latitude), 4), round(float(longitude), 4))
+        if cache_key in self._sun_cache:
+            return self._sun_cache[cache_key]
+        events = self._compute_sun_events(target_date, latitude, longitude, zone)
+        if len(self._sun_cache) > 16:
+            self._sun_cache.clear()
+        self._sun_cache[cache_key] = events
+        return events
+
+    def _compute_sun_events(
+        self, target_date: Any, latitude: float, longitude: float, zone: tzinfo
     ) -> dict[str, datetime] | None:
         location = LocationInfo(
             name="Local",
@@ -99,7 +124,7 @@ class SunScheduleEngine:
             longitude=longitude,
         )
         try:
-            sun_times = sun(location.observer, date=target_date, tzinfo=timezone)
+            sun_times = sun(location.observer, date=target_date, tzinfo=zone)
         except Exception:
             return None
 

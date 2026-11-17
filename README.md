@@ -1,43 +1,25 @@
 # Remote Monitor Controller
 
-Remote Monitor Controller is a fast Windows tray app for external display control over DDC/CI and built-in display control, with smooth automation and instant manual override from the tray.
+A Windows tray app for controlling external monitors over DDC/CI (and your built-in display) from a frosted-glass popup. Brightness follows the sun, an ambient light sensor, or your hand on the slider.
 
 ## Highlights
-- Extremely quick monitor discovery and reconnect from the tray.
-- Auto Brightness mode using ambient light sensor data with smoothing and step limits.
-- Monitor controls beyond brightness (contrast, sharpness, RGB gain, black level, and other supported VCP sliders).
-- Linked mode (one slider for all displays) and unlinked per-monitor mode.
-- Sunrise/sunset and fixed-time scheduling with offsets, per-display targets, and gradual transitions.
-- Persistent settings and startup launch support.
-
-## Features
-- Tray icon with quick actions: show popup, refresh monitors, apply schedule now, quit.
-- Compact popup panel from tray click (instead of a full main window).
-- Linked mode:
-  - `Link all displays` + one slider applies the same value to every detected monitor.
-- Unlinked mode:
-  - separate sliders for each monitor.
-- Settings:
-  - startup toggle,
-  - monitor picture-control popup (DDC/CI detected sliders like contrast, sharpness, black level, RGB gain, etc.),
-  - Auto Light ambient-sensor mode (linked: all displays, unlinked: computer display only),
-  - schedule enable/disable,
-  - gradual interpolation between schedule points,
-  - one-click sunrise/sunset ramp preset rules,
-  - auto location detect from IP or manual latitude/longitude,
-  - per-rule display target: `Display 1`, `Display 2`, or `Both`,
-  - anchor choices: `sunrise`, `sunset`, or fixed `specific time`,
-  - customizable schedule rules like `Display 1 + sunset +30 min -> 75%`.
-- Popup opens with current live monitor brightness values.
+- **Glass UI.** Translucent popup and settings windows with an optional Windows 11 acrylic blur, five themes (Midnight, Aurora, Graphite, Frost, Dune), glowing gradient sliders and smooth fade/slide animations.
+- **Instant and responsive.** The popup opens immediately. Monitor detection and DDC/CI writes happen in the background, and rapid slider drags are coalesced so the hardware only receives the latest value.
+- **Linked or per-monitor brightness.** One slider for every display, or one per monitor.
+- **Auto Light.** Ambient light sensor with smoothing and step limits (linked: all displays, unlinked: the computer display).
+- **Sunrise/sunset scheduling.** Drag points on a day graph, per-display curves, fixed-time or sun-relative anchors with offsets, gradual transitions and a one-click preset curve.
+- **Picture controls.** Contrast, sharpness, RGB gain, black level and other VCP sliders your monitor reports.
+- **Location.** Detected automatically from your IP, or enter latitude/longitude manually in Settings (manual coordinates are never overwritten).
 
 ## Requirements
-- Windows 10/11
+- Windows 10/11 (the acrylic blur needs Windows 11 22H2 or newer; older systems use the built-in translucent glass instead)
 - Python 3.10+
-- For external monitors, enable DDC/CI in the monitor OSD menu.
+- For external monitors, enable DDC/CI in the monitor's on-screen menu
 
 ## Install
 ```powershell
-cd "C:\Users\labar\Downloads\All Projects\Display-Brightness-Tray"
+git clone https://github.com/Frenchbear1/Remote-Monitor-Controller.git
+cd Remote-Monitor-Controller
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -45,16 +27,29 @@ pip install -r requirements.txt
 
 ## Run
 ```powershell
-cd "C:\Users\labar\Downloads\All Projects\Display-Brightness-Tray"
 .venv\Scripts\Activate.ps1
 python main.py
 ```
 
-After launch, the app lives in the system tray.
+The app lives in the system tray. Click the tray icon to open the popup; right-click for refresh / apply schedule / quit.
+
+## Build the executable
+```powershell
+pip install pyinstaller
+pyinstaller Remote-Monitor-Controller.spec
+```
+The result is written to `dist\Remote-Monitor-Controller.exe`.
+
+## Settings
+- **Appearance:** pick a theme; changes preview live and are discarded if you cancel.
+- **General:** launch at Windows startup, and toggle the frosted blur if it looks wrong on your system.
+- **Picture controls:** open monitor-specific sliders detected through DDC/CI (use *Deep scan* to ask the monitor for its full capability list).
+- **Scheduling:** enable the schedule, choose gradual transitions, set your location, then edit the curve.
+  - Double-click the graph to add a point, drag points to change time and brightness.
+  - Each point targets `Display 1`, `Display 2` or `Both`, anchored to `sunrise`, `sunset` or a specific time (with an offset).
+  - The first two detected displays map to `Display 1` and `Display 2`.
 
 ## Notes
-- Startup registration uses:
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-- Schedule can target `Display 1`, `Display 2`, or `Both` per rule.
-- If you use display-targeted rules, the first two detected displays map to `Display 1` and `Display 2`.
-- If auto-location fails, set latitude/longitude manually in Settings.
+- Settings are stored in `%APPDATA%\BrightnessTrayScheduler\config.json` (the folder name is kept so existing settings carry over).
+- Startup registration uses `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- If a monitor stops responding, an inline message names the display; check that DDC/CI is enabled in its menu.
