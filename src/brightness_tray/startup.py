@@ -3,7 +3,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import winreg
+try:
+    import winreg
+except ImportError:  # non-Windows (development / tests)
+    winreg = None  # type: ignore[assignment]
 
 
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -23,6 +26,8 @@ def build_startup_command() -> str:
 
 
 def is_startup_enabled() -> bool:
+    if winreg is None:
+        return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
             _, _ = winreg.QueryValueEx(key, RUN_VALUE_NAME)
@@ -34,6 +39,8 @@ def is_startup_enabled() -> bool:
 
 
 def set_startup_enabled(enabled: bool) -> bool:
+    if winreg is None:
+        return True
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE

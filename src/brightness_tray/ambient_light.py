@@ -43,9 +43,8 @@ class AmbientLightService:
         self._thread.start()
 
     def stop(self) -> None:
+        # Never block the GUI thread: the poll loop is a daemon and exits on its own.
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=0.8)
         self._thread = None
 
     def probe_sensor(self) -> float | None:

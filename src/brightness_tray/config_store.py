@@ -44,6 +44,8 @@ class ConfigStore:
             self.save(config)
             return config
 
+        if not isinstance(raw_data, dict):
+            return AppConfig()
         return self._parse(raw_data)
 
     def save(self, config: AppConfig) -> None:
@@ -58,6 +60,7 @@ class ConfigStore:
                 key: clamp_brightness(value) for key, value in config.monitor_levels.items()
             },
             "startup_enabled": bool(config.startup_enabled),
+            "blur_enabled": bool(config.blur_enabled),
             "schedule": {
                 "enabled": bool(config.schedule.enabled),
                 "gradual": bool(config.schedule.gradual),
@@ -76,7 +79,9 @@ class ConfigStore:
                 ],
             },
         }
-        self.config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path = self.config_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(self.config_path)
 
     def _parse(self, data: dict[str, Any]) -> AppConfig:
         config = AppConfig()
@@ -88,6 +93,7 @@ class ConfigStore:
             data.get("last_global_brightness", 100)
         )
         config.startup_enabled = bool(data.get("startup_enabled", True))
+        config.blur_enabled = bool(data.get("blur_enabled", True))
 
         monitor_levels = data.get("monitor_levels", {})
         if isinstance(monitor_levels, dict):

@@ -2,29 +2,33 @@ from __future__ import annotations
 
 import os
 import sys
+import time as wall_time
 from datetime import datetime
 
-from PySide6.QtCore import QObject, QTimer
-from PySide6.QtGui import QAction, QCursor
+from PySide6.QtCore import QObject, QTimer, Qt
+from PySide6.QtGui import QAction, QCursor, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QMenu,
     QMessageBox,
-    QStyle,
     QSystemTrayIcon,
 )
 
 from .brightness_service import BrightnessService
 from .config_store import ConfigStore
+from .glass import set_blur_enabled
+from .icons import app_icon
 from .location import detect_location_from_ip
 from .models import AppConfig, ScheduleRule
 from .startup import set_startup_enabled
 from .sun_schedule import SunScheduleEngine
-from .themes import build_stylesheet, normalize_theme_name
-from .ui import BrightnessControlWindow
+from .themes import normalize_theme_name
+from .ui import BrightnessControlWindow, apply_app_theme
+from .workers import run_async
 
 
-APP_DISPLAY_NAME = os.getenv("BRIGHTNESS_TRAY_NAME", "Brightness Tray")
+APP_DISPLAY_NAME = os.getenv("BRIGHTNESS_TRAY_NAME", "Remote Monitor Controller")
+_LOCATION_RETRY_SECONDS = 60.0
 
 
 class TrayController(QObject):
@@ -34,6 +38,9 @@ class TrayController(QObject):
 
         self.config_store = ConfigStore()
         self.config = self.config_store.load()
+        self._location_lookup_in_flight = False
+        self._last_location_attempt = 0.0
+        set_blur_enabled(self.config.blur_enabled)
         self._apply_theme()
         self.brightness_service = BrightnessService()
         self.schedule_engine = SunScheduleEngine()
@@ -48,7 +55,7 @@ class TrayController(QObject):
         self._expected_auto_targets: dict[str, int] = {}
 
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray_icon.setIcon(app_icon())
         self.tray_icon.setToolTip(APP_DISPLAY_NAME)
         self.tray_icon.setContextMenu(self._build_menu())
         self.tray_icon.activated.connect(self._handle_tray_activation)
@@ -66,6 +73,12 @@ class TrayController(QObject):
 
     def _build_menu(self) -> QMenu:
         menu = QMenu()
+        menu.setWindowFlags(
+            menu.windowFlags()
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         open_action = QAction("Show Popup", self)
         open_action.triggered.connect(self._show_popup)
@@ -73,7 +86,7 @@ class TrayController(QObject):
 
         refresh_action = QAction("Refresh Monitors", self)
         refresh_action.triggered.connect(
-            lambda _checked=False: self.window.refresh_monitors(apply_saved=False)
+            lambda _checked=False: self.window.refresh_monitors_async()
         )
         menu.addAction(refresh_action)
 
@@ -104,10 +117,12 @@ class TrayController(QObject):
         self._show_popup()
 
     def _show_popup(self, _checked: bool = False) -> None:
-        self.window.refresh_monitors(apply_saved=False)
+        # Show instantly with the last known levels, then refresh in the background.
         self.window.show_as_popup(QCursor.pos())
+        self.window.refresh_monitors_async()
 
     def _quit(self, _checked: bool = False) -> None:
+        self.window.flush_pending_save()
         self.tray_icon.hide()
         self.app.quit()
 
@@ -117,6 +132,7 @@ class TrayController(QObject):
         self.config = updated_config
         self.window.config = updated_config
         self._apply_theme()
+        self._last_location_attempt = 0.0
         self._expected_auto_targets = {}
         self._apply_startup_setting()
         self._resolve_location_if_needed()
@@ -142,27 +158,42 @@ class TrayController(QObject):
             self.schedule_timer.setInterval(interval_ms)
 
     def _resolve_location_if_needed(self) -> None:
-        if not self.config.schedule.enabled:
-            return
-        if not self._schedule_has_sun_rules():
-            return
-
-        coords = detect_location_from_ip()
-        if coords is None:
+        schedule = self.config.schedule
+        if not schedule.enabled or not self._schedule_has_sun_rules():
             return
 
-        latitude, longitude = coords
-        if (
-            self.config.schedule.latitude is not None
-            and self.config.schedule.longitude is not None
-            and abs(self.config.schedule.latitude - latitude) < 0.0001
-            and abs(self.config.schedule.longitude - longitude) < 0.0001
+        has_fix = schedule.latitude is not None and schedule.longitude is not None
+        if not schedule.auto_location and has_fix:
+            return  # the user typed their coordinates; never overwrite them
+        if self._location_lookup_in_flight:
+            return
+        now = wall_time.monotonic()
+        if self._last_location_attempt and now - self._last_location_attempt < (
+            _LOCATION_RETRY_SECONDS if not has_fix else 6 * 3600
         ):
             return
 
-        self.config.schedule.latitude = latitude
-        self.config.schedule.longitude = longitude
+        self._location_lookup_in_flight = True
+        self._last_location_attempt = now
+        run_async(self, detect_location_from_ip, self._finish_location_lookup)
+
+    def _finish_location_lookup(self, coords, error) -> None:
+        self._location_lookup_in_flight = False
+        if error is not None or coords is None:
+            return
+        latitude, longitude = coords
+        schedule = self.config.schedule
+        if (
+            schedule.latitude is not None
+            and schedule.longitude is not None
+            and abs(schedule.latitude - latitude) < 0.0001
+            and abs(schedule.longitude - longitude) < 0.0001
+        ):
+            return
+        schedule.latitude = latitude
+        schedule.longitude = longitude
         self.config_store.save(self.config)
+        self._update_schedule_now(force_apply=True)
 
     def _rules_for_display_index(self, display_index: int) -> list[ScheduleRule]:
         if display_index == 0:
@@ -215,6 +246,13 @@ class TrayController(QObject):
         return len(active_values) >= 2 and len(set(active_values)) > 1
 
     def _update_schedule_now(self, force_apply: bool = False) -> None:
+        self._update_schedule_inner(force_apply)
+        status = self.window._schedule_status_text
+        tooltip = APP_DISPLAY_NAME if status == "Schedule: off" else f"{APP_DISPLAY_NAME}\n{status}"
+        if self.tray_icon.toolTip() != tooltip:
+            self.tray_icon.setToolTip(tooltip)
+
+    def _update_schedule_inner(self, force_apply: bool = False) -> None:
         if self.window.is_ambient_auto_enabled():
             if self.config.schedule.enabled:
                 self.window.set_schedule_status(
@@ -264,13 +302,18 @@ class TrayController(QObject):
     def _apply_theme(self) -> None:
         theme_name = normalize_theme_name(self.config.theme)
         self.config.theme = theme_name
-        self.app.setStyleSheet(build_stylesheet(theme_name))
+        apply_app_theme(theme_name)
 
 
 def run() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_DISPLAY_NAME)
+    app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    base_font = QFont()
+    base_font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Noto Sans"])
+    base_font.setPointSizeF(9.0)
+    app.setFont(base_font)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(

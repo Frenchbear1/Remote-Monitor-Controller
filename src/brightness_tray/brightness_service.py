@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import screen_brightness_control as sbc
 
@@ -61,8 +62,14 @@ class BrightnessService:
     def __init__(self) -> None:
         self.monitors: list[MonitorHandle] = []
         self._picture_controls_cache: dict[str, list[PictureControl]] = {}
+        # DDC/CI and WMI are not safe to drive from several threads at once.
+        self._io_lock = threading.RLock()
 
     def refresh_monitors(self) -> list[MonitorHandle]:
+        with self._io_lock:
+            return self._refresh_monitors_locked()
+
+    def _refresh_monitors_locked(self) -> list[MonitorHandle]:
         raw_monitors = sbc.list_monitors_info(allow_duplicates=False)
         parsed: list[MonitorHandle] = []
         seen_keys: dict[str, int] = {}
@@ -79,24 +86,26 @@ class BrightnessService:
         return list(self.monitors)
 
     def get_brightness(self, monitor: MonitorHandle) -> int | None:
-        for call_kwargs in self._build_call_args(monitor):
-            try:
-                value = sbc.get_brightness(**call_kwargs)
-                if isinstance(value, list):
-                    value = value[0]
-                return clamp_brightness(value)
-            except Exception:
-                continue
+        with self._io_lock:
+            for call_kwargs in self._build_call_args(monitor):
+                try:
+                    value = sbc.get_brightness(**call_kwargs)
+                    if isinstance(value, list):
+                        value = value[0]
+                    return clamp_brightness(value)
+                except Exception:
+                    continue
         return None
 
     def set_brightness(self, monitor: MonitorHandle, value: int) -> bool:
         target = clamp_brightness(value)
-        for call_kwargs in self._build_call_args(monitor):
-            try:
-                sbc.set_brightness(target, **call_kwargs)
-                return True
-            except Exception:
-                continue
+        with self._io_lock:
+            for call_kwargs in self._build_call_args(monitor):
+                try:
+                    sbc.set_brightness(target, **call_kwargs)
+                    return True
+                except Exception:
+                    continue
         return False
 
     def list_picture_controls(
@@ -525,3 +534,87 @@ class BrightnessService:
         if host_name:
             return BrightnessService._normalize_device_name_for_ui(host_name)
         return None
+
+
+@contextmanager
+def com_initialized():
+    """Initialise COM for the current worker thread (WMI needs it off the main thread)."""
+    initialised = False
+    try:
+        import pythoncom  # type: ignore
+
+        pythoncom.CoInitialize()
+        initialised = True
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        if initialised:
+            try:
+                import pythoncom  # type: ignore
+
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+class BrightnessWriter:
+    """Applies brightness writes on a background thread, newest value per display wins.
+
+    DDC/CI writes can take 50-300 ms each. Doing them on the GUI thread made sliders stutter, so
+    the UI hands values to this queue instead and returns immediately.
+    """
+
+    def __init__(
+        self,
+        service: BrightnessService,
+        on_failure: Callable[[str], None] | None = None,
+        on_success: Callable[[str], None] | None = None,
+    ) -> None:
+        self._service = service
+        self._on_failure = on_failure
+        self._on_success = on_success
+        self._pending: dict[str, tuple[MonitorHandle, int]] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._failing: set[str] = set()
+        self._thread = threading.Thread(target=self._run, name="brightness-writer", daemon=True)
+        self._thread.start()
+
+    def submit(self, monitor: MonitorHandle, value: int) -> None:
+        with self._lock:
+            self._pending[monitor.key] = (monitor, clamp_brightness(value))
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def _run(self) -> None:
+        with com_initialized():
+            while not self._stop.is_set():
+                self._wake.wait()
+                self._wake.clear()
+                while not self._stop.is_set():
+                    with self._lock:
+                        if not self._pending:
+                            break
+                        key = next(iter(self._pending))
+                        monitor, value = self._pending.pop(key)
+                    ok = False
+                    try:
+                        ok = self._service.set_brightness(monitor, value)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        if key in self._failing:
+                            self._failing.discard(key)
+                            if self._on_success is not None:
+                                self._on_success(monitor.name)
+                    elif key not in self._failing:
+                        self._failing.add(key)
+                        if self._on_failure is not None:
+                            self._on_failure(monitor.name)
+                    time.sleep(0.02)
