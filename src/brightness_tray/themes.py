@@ -12,8 +12,9 @@ THEME_DARK = "dark"
 THEME_GRAY = "gray"
 THEME_SAND = "sand"
 THEME_AURORA = "aurora"
+THEME_CLEAR = "clear"
 
-THEME_OPTIONS = (THEME_DARK, THEME_AURORA, THEME_GRAY, THEME_LIGHT, THEME_SAND)
+THEME_OPTIONS = (THEME_DARK, THEME_AURORA, THEME_CLEAR, THEME_GRAY, THEME_LIGHT, THEME_SAND)
 
 RGBA = tuple[int, int, int, int]
 
@@ -41,6 +42,7 @@ class Theme:
     accent2: str
     accent_fg: str
     track: RGBA
+    shine: bool = False  # liquid-glass extras: rim light + diagonal specular sweep
 
 
 _THEMES: dict[str, Theme] = {
@@ -87,6 +89,29 @@ _THEMES: dict[str, Theme] = {
         accent2="#9b6bff",
         accent_fg="#04141a",
         track=(255, 255, 255, 30),
+    ),
+    THEME_CLEAR: Theme(
+        key=THEME_CLEAR,
+        label="Liquid Glass",
+        dark=True,
+        top=(18, 22, 34, 34),
+        bottom=(10, 12, 22, 66),
+        blur_alpha_scale=1.0,
+        glow_a=(255, 255, 255, 34),
+        glow_b=(160, 210, 255, 30),
+        fg="#ffffff",
+        muted="#e4e9f4",
+        solid="#1a1f2e",
+        border=(255, 255, 255, 120),
+        card=(255, 255, 255, 22),
+        card_border=(255, 255, 255, 62),
+        hover=(255, 255, 255, 44),
+        field=(0, 0, 0, 58),
+        accent="#a9dcff",
+        accent2="#d9c0ff",
+        accent_fg="#0b1224",
+        track=(255, 255, 255, 46),
+        shine=True,
     ),
     THEME_GRAY: Theme(
         key=THEME_GRAY,
