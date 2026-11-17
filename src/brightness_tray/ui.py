@@ -613,7 +613,7 @@ class ScheduleGraphWidget(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(232)
+        self.setMinimumHeight(200)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip("Double-click the graph to add a point. Drag points to change time and brightness.")
@@ -630,7 +630,7 @@ class ScheduleGraphWidget(QWidget):
         self._gradual = True
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
-        return QSize(720, 240)
+        return QSize(720, 210)
 
     def set_rules(self, rules: list[ScheduleRule], selected_index: int | None = None) -> None:
         self._rules = [deepcopy(rule) for rule in rules]
@@ -1369,8 +1369,13 @@ class SettingsDialog(QDialog):
         brightness_service: BrightnessService | None = None,
         monitor_handles: list[MonitorHandle] | None = None,
         parent: QWidget | None = None,
+        preview_writer: BrightnessWriter | None = None,
+        current_levels: dict[str, int] | None = None,
     ):
         super().__init__(parent)
+        self._preview_writer = preview_writer
+        self._original_levels = dict(current_levels or {})
+        self._previewed_keys: set[str] = set()
         self.setWindowTitle("Remote Monitor Controller Settings")
         self.setMinimumWidth(740)
         _apply_rounded_popup_chrome(self, "settingsDialog")
@@ -1576,11 +1581,64 @@ class SettingsDialog(QDialog):
         self.point_brightness_spin = QSpinBox()
         self.point_brightness_spin.setRange(0, 100)
         self.point_brightness_spin.setSuffix("%")
-        self.point_brightness_spin.setMaximumWidth(70)
-        rule_editor_layout.addWidget(QLabel("Level"))
-        rule_editor_layout.addWidget(self.point_brightness_spin)
+        self.point_brightness_spin.setParent(self.rule_editor_widget)
+        self.point_brightness_spin.hide()  # model for the level slider below
         rule_editor_layout.addStretch(1)
         schedule_layout.addWidget(self.rule_editor_widget)
+
+        self.level_panel = QFrame()
+        self.level_panel.setObjectName("card")
+        level_layout = QVBoxLayout(self.level_panel)
+        level_layout.setContentsMargins(14, 8, 14, 10)
+        level_layout.setSpacing(2)
+        level_header = QHBoxLayout()
+        level_caption = QLabel("Brightness at this point")
+        level_caption.setObjectName("muted")
+        level_header.addWidget(level_caption)
+        self.level_descriptor_label = QLabel("")
+        self.level_descriptor_label.setObjectName("hint")
+        level_header.addWidget(self.level_descriptor_label)
+        level_header.addStretch(1)
+        self.level_value_label = QLabel("0%")
+        self.level_value_label.setObjectName("clockValue")
+        level_header.addWidget(self.level_value_label)
+        level_layout.addLayout(level_header)
+        self.level_slider = GlowSlider(Qt.Orientation.Horizontal, brightness_scale=True)
+        self.level_slider.setRange(0, 100)
+        level_layout.addWidget(self.level_slider)
+        level_footer = QHBoxLayout()
+        level_footer.setSpacing(6)
+        self.level_preset_buttons: list[QPushButton] = []
+        for preset_label, preset_value in (
+            ("Night 15", 15),
+            ("Dim 35", 35),
+            ("Cozy 55", 55),
+            ("Bright 80", 80),
+            ("Max 100", 100),
+        ):
+            chip = QPushButton(preset_label.rsplit(" ", 1)[0] + f" · {preset_value}%")
+            chip.setObjectName("chip")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(
+                lambda _checked=False, value=preset_value: self.point_brightness_spin.setValue(value)
+            )
+            self.level_preset_buttons.append(chip)
+            level_footer.addWidget(chip)
+        level_footer.addStretch(1)
+        self.live_preview_checkbox = QCheckBox("Preview on my displays")
+        self.live_preview_checkbox.setToolTip(
+            "Changes your real monitors while you edit this point, so you can see how bright "
+            "it really is. Your current brightness is restored when you close this window."
+        )
+        self.live_preview_checkbox.setChecked(
+            self._preview_writer is not None and bool(self.monitor_handles)
+        )
+        self.live_preview_checkbox.setEnabled(
+            self._preview_writer is not None and bool(self.monitor_handles)
+        )
+        level_footer.addWidget(self.live_preview_checkbox)
+        level_layout.addLayout(level_footer)
+        schedule_layout.addWidget(self.level_panel)
 
         self.rule_buttons_widget = QWidget()
         rule_button_layout = QHBoxLayout(self.rule_buttons_widget)
@@ -1653,6 +1711,9 @@ class SettingsDialog(QDialog):
         self.point_brightness_spin.valueChanged.connect(
             lambda _value: self._apply_rule_editor_to_selected()
         )
+        self.point_brightness_spin.valueChanged.connect(self._handle_level_spin_changed)
+        self.level_slider.valueChanged.connect(self.point_brightness_spin.setValue)
+        self.live_preview_checkbox.toggled.connect(self._handle_live_preview_toggled)
         self._load_from_config()
         self._schedule_undo_enabled = True
         self._clock_timer = QTimer(self)
@@ -2169,9 +2230,90 @@ class SettingsDialog(QDialog):
         ]
         self._refresh_default_rules_button_state()
         self._sync_selected_rule_editor()
+        self._maybe_preview()
 
     def _handle_schedule_graph_selection_changed(self, _index: int) -> None:
         self._sync_selected_rule_editor()
+        self._maybe_preview()
+
+    # -- level slider + live preview ------------------------------------------------
+    @staticmethod
+    def _brightness_descriptor(value: int) -> str:
+        if value <= 8:
+            return "barely lit"
+        if value <= 25:
+            return "night-time dim"
+        if value <= 45:
+            return "evening dim"
+        if value <= 65:
+            return "comfortable"
+        if value <= 85:
+            return "bright"
+        return "full blast"
+
+    def _handle_level_spin_changed(self, value: int) -> None:
+        bounded = clamp_brightness(value)
+        self.level_slider.blockSignals(True)
+        self.level_slider.setValue(bounded)
+        self.level_slider.blockSignals(False)
+        self.level_value_label.setText(f"{bounded}%")
+        self.level_value_label.setStyleSheet(_big_value_style(bounded))
+        self.level_descriptor_label.setText(f"· {self._brightness_descriptor(bounded)}")
+        if not self._syncing_rule_editor:
+            self._maybe_preview()
+
+    def _preview_targets(self, target: str) -> list[MonitorHandle]:
+        handles = self.monitor_handles
+        if target == "display1":
+            return handles[:1]
+        if target == "display2":
+            return handles[1:2]
+        return list(handles)
+
+    def _maybe_preview(self) -> None:
+        if (
+            self._preview_writer is None
+            or not self._schedule_undo_enabled
+            or not self.live_preview_checkbox.isChecked()
+        ):
+            return
+        index = self.schedule_graph.selected_index()
+        if index < 0 or index >= len(self._schedule_rules):
+            return
+        rule = self._schedule_rules[index]
+        targets = self._preview_targets(rule.target)
+        target_keys = {monitor.key for monitor in targets}
+        # Put displays that are no longer being previewed back where they were.
+        for monitor in self.monitor_handles:
+            if monitor.key in self._previewed_keys and monitor.key not in target_keys:
+                original = self._original_levels.get(monitor.key)
+                if original is not None:
+                    self._preview_writer.submit(monitor, original)
+                self._previewed_keys.discard(monitor.key)
+        for monitor in targets:
+            self._preview_writer.submit(monitor, clamp_brightness(rule.brightness))
+            self._previewed_keys.add(monitor.key)
+
+    def _restore_preview(self) -> None:
+        if self._preview_writer is None:
+            return
+        for monitor in self.monitor_handles:
+            if monitor.key not in self._previewed_keys:
+                continue
+            original = self._original_levels.get(monitor.key)
+            if original is not None:
+                self._preview_writer.submit(monitor, original)
+        self._previewed_keys.clear()
+
+    def _handle_live_preview_toggled(self, checked: bool) -> None:
+        if checked:
+            self._maybe_preview()
+        else:
+            self._restore_preview()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        self._restore_preview()
+        super().done(result)
 
     def _set_combo_current_data(self, combo: QComboBox, value: str) -> None:
         index = combo.findData(value)
@@ -2201,6 +2343,7 @@ class SettingsDialog(QDialog):
             ):
                 widget.setEnabled(enabled)
             self.remove_rule_button.setEnabled(enabled)
+            self.level_panel.setEnabled(enabled)
 
             if selected_rule is None:
                 self.point_time_edit.clear()
@@ -2335,6 +2478,7 @@ class SettingsDialog(QDialog):
         self._schedule_rules[selected_index] = rule
         self.schedule_graph.set_rules(self._schedule_rules, selected_index=selected_index)
         self._refresh_default_rules_button_state()
+        self._maybe_preview()
         if time_is_source:
             self._syncing_rule_editor = True
             try:
@@ -3230,6 +3374,8 @@ class BrightnessControlWindow(QWidget):
             brightness_service=self.service,
             monitor_handles=monitor_handles,
             parent=self,
+            preview_writer=self._writer,
+            current_levels={row.monitor.key: row.slider.value() for row in self.monitor_rows},
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

@@ -432,6 +432,11 @@ def build_stylesheet(theme_name: str) -> str:
         border-radius: 13px;
         padding: 5px 16px;
     }}
+    QPushButton#chip {{
+        padding: 3px 10px;
+        border-radius: 10px;
+        font-size: 8pt;
+    }}
     QPushButton#danger:hover {{
         background: rgba(239, 68, 68, 70);
         border: 1px solid rgba(239, 68, 68, 140);
