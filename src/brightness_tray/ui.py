@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFrame,
+    QGridLayout,
     QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
@@ -70,7 +71,7 @@ from .glass import (
     paint_glass,
     set_blur_enabled,
 )
-from .icons import app_glyph_pixmap, glyph_icon
+from .icons import glyph_icon
 from .location import LocationContext, detect_location_context_from_ip
 from .models import AppConfig, ScheduleRule, clamp_brightness, default_schedule_rules
 from .themes import (
@@ -597,8 +598,8 @@ class ScheduleGraphWidget(QWidget):
 
     _LEFT_MARGIN = 54
     _RIGHT_MARGIN = 18
-    _TOP_MARGIN = 34
-    _BOTTOM_MARGIN = 38
+    _TOP_MARGIN = 30
+    _BOTTOM_MARGIN = 32
     _HIT_RADIUS = 12
     _DRAG_MINUTE_STEP = 5
     _STARS = tuple(
@@ -612,7 +613,7 @@ class ScheduleGraphWidget(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(290)
+        self.setMinimumHeight(200)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip("Double-click the graph to add a point. Drag points to change time and brightness.")
@@ -629,7 +630,7 @@ class ScheduleGraphWidget(QWidget):
         self._gradual = True
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
-        return QSize(720, 300)
+        return QSize(720, 210)
 
     def set_rules(self, rules: list[ScheduleRule], selected_index: int | None = None) -> None:
         self._rules = [deepcopy(rule) for rule in rules]
@@ -1368,10 +1369,15 @@ class SettingsDialog(QDialog):
         brightness_service: BrightnessService | None = None,
         monitor_handles: list[MonitorHandle] | None = None,
         parent: QWidget | None = None,
+        preview_writer: BrightnessWriter | None = None,
+        current_levels: dict[str, int] | None = None,
     ):
         super().__init__(parent)
+        self._preview_writer = preview_writer
+        self._original_levels = dict(current_levels or {})
+        self._previewed_keys: set[str] = set()
         self.setWindowTitle("Remote Monitor Controller Settings")
-        self.setMinimumWidth(780)
+        self.setMinimumWidth(740)
         _apply_rounded_popup_chrome(self, "settingsDialog")
 
         self._source_config = deepcopy(current_config)
@@ -1412,13 +1418,17 @@ class SettingsDialog(QDialog):
         content_layout.setContentsMargins(0, 0, 8, 0)
         content_layout.setSpacing(4)
 
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
         appearance_box = QGroupBox("Appearance")
-        appearance_layout = QHBoxLayout(appearance_box)
-        appearance_layout.setSpacing(10)
+        appearance_layout = QGridLayout(appearance_box)
+        appearance_layout.setHorizontalSpacing(8)
+        appearance_layout.setVerticalSpacing(8)
         self.theme_button_group = QButtonGroup(self)
         self.theme_button_group.setExclusive(True)
         self.theme_buttons: dict[str, QPushButton] = {}
-        for theme_name in THEME_OPTIONS:
+        for theme_index, theme_name in enumerate(THEME_OPTIONS):
             button = ThemeSwatchButton(theme_name)
             self.theme_button_group.addButton(button)
             self.theme_buttons[theme_name] = button
@@ -1428,63 +1438,55 @@ class SettingsDialog(QDialog):
                     checked,
                 )
             )
-            appearance_layout.addWidget(button)
-        appearance_layout.addStretch(1)
-        content_layout.addWidget(appearance_box)
+            appearance_layout.addWidget(button, theme_index // 3, theme_index % 3)
+        top_row.addWidget(appearance_box, stretch=0)
 
         startup_box = QGroupBox("General")
         startup_layout = QVBoxLayout(startup_box)
         startup_layout.setSpacing(8)
-        self.startup_checkbox = QCheckBox("Launch automatically when Windows starts")
+        self.startup_checkbox = QCheckBox("Launch at Windows startup")
         startup_layout.addWidget(self.startup_checkbox)
-        self.blur_checkbox = QCheckBox("Frosted blur behind windows (Windows 11)")
+        self.blur_checkbox = QCheckBox("Frosted blur (Windows 11)")
         self.blur_checkbox.setToolTip(
             "Uses the Windows acrylic backdrop. Turn off if the windows look wrong on your system."
         )
         startup_layout.addWidget(self.blur_checkbox)
-        content_layout.addWidget(startup_box)
-
-        picture_controls_box = QGroupBox("Display Picture Controls")
-        picture_controls_layout = QVBoxLayout(picture_controls_box)
-        self.picture_controls_help_label = QLabel(
-            "Open monitor-specific picture sliders (for example contrast, sharpness, "
-            "black level, and color controls) detected through DDC/CI."
+        startup_layout.addStretch(1)
+        self.picture_controls_button = QPushButton("Picture controls…")
+        self.picture_controls_button.setToolTip(
+            "Contrast, sharpness, black level and colour sliders detected through DDC/CI"
         )
-        self.picture_controls_help_label.setWordWrap(True)
-        self.picture_controls_help_label.setObjectName("muted")
-        picture_controls_layout.addWidget(self.picture_controls_help_label)
-        picture_controls_row = QHBoxLayout()
-        self.picture_controls_button = QPushButton("Open Picture Controls")
-        picture_controls_row.addWidget(self.picture_controls_button)
-        picture_controls_row.addStretch(1)
-        picture_controls_layout.addLayout(picture_controls_row)
-        content_layout.addWidget(picture_controls_box)
+        startup_layout.addWidget(self.picture_controls_button)
+        top_row.addWidget(startup_box, stretch=1)
+        content_layout.addLayout(top_row)
 
         schedule_box = QGroupBox("Sunrise/Sunset Scheduling")
         schedule_layout = QVBoxLayout(schedule_box)
 
         schedule_top_layout = QHBoxLayout()
-        schedule_toggle_layout = QVBoxLayout()
+        schedule_toggle_layout = QHBoxLayout()
+        schedule_toggle_layout.setSpacing(18)
         self.schedule_enabled_checkbox = QCheckBox("Enable automatic schedule")
-        self.gradual_checkbox = QCheckBox("Use gradual transitions between schedule points")
+        self.gradual_checkbox = QCheckBox("Gradual transitions")
         schedule_toggle_layout.addWidget(self.schedule_enabled_checkbox)
         schedule_toggle_layout.addWidget(self.gradual_checkbox)
+        schedule_toggle_layout.addStretch(1)
         schedule_top_layout.addLayout(schedule_toggle_layout, stretch=1)
 
         self.location_status_widget = QWidget()
         self.location_status_widget.setObjectName("scheduleTimeCard")
-        location_status_layout = QVBoxLayout(self.location_status_widget)
-        location_status_layout.setContentsMargins(8, 6, 8, 6)
-        location_status_layout.setSpacing(6)
+        location_status_layout = QHBoxLayout(self.location_status_widget)
+        location_status_layout.setContentsMargins(12, 5, 12, 5)
+        location_status_layout.setSpacing(14)
         self.location_time_label = QLabel("--:--")
         self.location_time_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self.sunrise_time_label = QLabel("Sunrise --:--")
+        self.sunrise_time_label = QLabel("☀ --:--")
         self.sunrise_time_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self.sunset_time_label = QLabel("Sunset --:--")
+        self.sunset_time_label = QLabel("☾ --:--")
         self.sunset_time_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -1498,35 +1500,35 @@ class SettingsDialog(QDialog):
         schedule_top_layout.addWidget(
             self.location_status_widget,
             0,
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
         )
         schedule_layout.addLayout(schedule_top_layout)
 
         location_row = QHBoxLayout()
         location_row.setSpacing(8)
-        self.auto_location_checkbox = QCheckBox("Detect my location automatically")
+        self.auto_location_checkbox = QCheckBox("Auto-detect location")
         location_row.addWidget(self.auto_location_checkbox)
-        location_row.addStretch(1)
+        self.location_hint_label = QLabel("")
+        self.location_hint_label.setObjectName("hint")
+        self.location_hint_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        location_row.addWidget(self.location_hint_label, stretch=1)
         self.latitude_spin = QDoubleSpinBox()
         self.latitude_spin.setRange(-90.0, 90.0)
         self.latitude_spin.setDecimals(4)
-        self.latitude_spin.setSuffix("° N")
-        self.latitude_spin.setMinimumWidth(112)
+        self.latitude_spin.setPrefix("Lat ")
+        self.latitude_spin.setSuffix("°")
+        self.latitude_spin.setMinimumWidth(124)
         self.longitude_spin = QDoubleSpinBox()
         self.longitude_spin.setRange(-180.0, 180.0)
         self.longitude_spin.setDecimals(4)
-        self.longitude_spin.setSuffix("° E")
-        self.longitude_spin.setMinimumWidth(118)
-        location_row.addWidget(QLabel("Latitude"))
+        self.longitude_spin.setPrefix("Lon ")
+        self.longitude_spin.setSuffix("°")
+        self.longitude_spin.setMinimumWidth(130)
         location_row.addWidget(self.latitude_spin)
-        location_row.addWidget(QLabel("Longitude"))
         location_row.addWidget(self.longitude_spin)
         self.detect_location_button = QPushButton("Detect now")
         location_row.addWidget(self.detect_location_button)
         schedule_layout.addLayout(location_row)
-        self.location_hint_label = QLabel("")
-        self.location_hint_label.setObjectName("hint")
-        schedule_layout.addWidget(self.location_hint_label)
 
         self.schedule_graph = ScheduleGraphWidget(self._build_target_choices())
         schedule_layout.addWidget(self.schedule_graph)
@@ -1534,21 +1536,29 @@ class SettingsDialog(QDialog):
         self.rule_editor_widget = QWidget()
         rule_editor_layout = QHBoxLayout(self.rule_editor_widget)
         rule_editor_layout.setContentsMargins(0, 0, 0, 0)
-        rule_editor_layout.setSpacing(8)
+        rule_editor_layout.setSpacing(5)
 
         self.selected_rule_label = QLabel("Point")
-        self.selected_rule_label.setMinimumWidth(86)
+        self.selected_rule_label.setMinimumWidth(52)
         rule_editor_layout.addWidget(self.selected_rule_label)
 
         self.point_target_combo = QComboBox()
         for value, label in self._build_target_choices():
             self.point_target_combo.addItem(label, userData=value)
-        self.point_target_combo.setMinimumWidth(170)
+        self.point_target_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.point_target_combo.setMinimumContentsLength(12)
+        self.point_target_combo.view().setMinimumWidth(260)
         rule_editor_layout.addWidget(QLabel("Display"))
         rule_editor_layout.addWidget(self.point_target_combo)
 
         self.point_anchor_combo = QComboBox()
         self.point_anchor_combo.addItems(["sunrise", "sunset", "specific time"])
+        self.point_anchor_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.point_anchor_combo.setMinimumContentsLength(8)
         rule_editor_layout.addWidget(QLabel("Anchor"))
         rule_editor_layout.addWidget(self.point_anchor_combo)
 
@@ -1556,7 +1566,7 @@ class SettingsDialog(QDialog):
         self.point_time_edit.setPlaceholderText("HH:MM")
         time_regex = QRegularExpression(r"^([01]?\d|2[0-3]):[0-5]\d$")
         self.point_time_edit.setValidator(QRegularExpressionValidator(time_regex, self))
-        self.point_time_edit.setMaximumWidth(74)
+        self.point_time_edit.setMaximumWidth(64)
         rule_editor_layout.addWidget(QLabel("Time"))
         rule_editor_layout.addWidget(self.point_time_edit)
 
@@ -1564,18 +1574,71 @@ class SettingsDialog(QDialog):
         self.point_offset_spin.setRange(-1440, 1440)
         self.point_offset_spin.setSingleStep(5)
         self.point_offset_spin.setSuffix(" min")
-        self.point_offset_spin.setMaximumWidth(96)
+        self.point_offset_spin.setMaximumWidth(92)
         rule_editor_layout.addWidget(QLabel("Offset"))
         rule_editor_layout.addWidget(self.point_offset_spin)
 
         self.point_brightness_spin = QSpinBox()
         self.point_brightness_spin.setRange(0, 100)
         self.point_brightness_spin.setSuffix("%")
-        self.point_brightness_spin.setMaximumWidth(76)
-        rule_editor_layout.addWidget(QLabel("Brightness"))
-        rule_editor_layout.addWidget(self.point_brightness_spin)
+        self.point_brightness_spin.setParent(self.rule_editor_widget)
+        self.point_brightness_spin.hide()  # model for the level slider below
         rule_editor_layout.addStretch(1)
         schedule_layout.addWidget(self.rule_editor_widget)
+
+        self.level_panel = QFrame()
+        self.level_panel.setObjectName("card")
+        level_layout = QVBoxLayout(self.level_panel)
+        level_layout.setContentsMargins(14, 8, 14, 10)
+        level_layout.setSpacing(2)
+        level_header = QHBoxLayout()
+        level_caption = QLabel("Brightness at this point")
+        level_caption.setObjectName("muted")
+        level_header.addWidget(level_caption)
+        self.level_descriptor_label = QLabel("")
+        self.level_descriptor_label.setObjectName("hint")
+        level_header.addWidget(self.level_descriptor_label)
+        level_header.addStretch(1)
+        self.level_value_label = QLabel("0%")
+        self.level_value_label.setObjectName("clockValue")
+        level_header.addWidget(self.level_value_label)
+        level_layout.addLayout(level_header)
+        self.level_slider = GlowSlider(Qt.Orientation.Horizontal, brightness_scale=True)
+        self.level_slider.setRange(0, 100)
+        level_layout.addWidget(self.level_slider)
+        level_footer = QHBoxLayout()
+        level_footer.setSpacing(6)
+        self.level_preset_buttons: list[QPushButton] = []
+        for preset_label, preset_value in (
+            ("Night 15", 15),
+            ("Dim 35", 35),
+            ("Cozy 55", 55),
+            ("Bright 80", 80),
+            ("Max 100", 100),
+        ):
+            chip = QPushButton(preset_label.rsplit(" ", 1)[0] + f" · {preset_value}%")
+            chip.setObjectName("chip")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(
+                lambda _checked=False, value=preset_value: self.point_brightness_spin.setValue(value)
+            )
+            self.level_preset_buttons.append(chip)
+            level_footer.addWidget(chip)
+        level_footer.addStretch(1)
+        self.live_preview_checkbox = QCheckBox("Preview on my displays")
+        self.live_preview_checkbox.setToolTip(
+            "Changes your real monitors while you edit this point, so you can see how bright "
+            "it really is. Your current brightness is restored when you close this window."
+        )
+        self.live_preview_checkbox.setChecked(
+            self._preview_writer is not None and bool(self.monitor_handles)
+        )
+        self.live_preview_checkbox.setEnabled(
+            self._preview_writer is not None and bool(self.monitor_handles)
+        )
+        level_footer.addWidget(self.live_preview_checkbox)
+        level_layout.addLayout(level_footer)
+        schedule_layout.addWidget(self.level_panel)
 
         self.rule_buttons_widget = QWidget()
         rule_button_layout = QHBoxLayout(self.rule_buttons_widget)
@@ -1648,6 +1711,9 @@ class SettingsDialog(QDialog):
         self.point_brightness_spin.valueChanged.connect(
             lambda _value: self._apply_rule_editor_to_selected()
         )
+        self.point_brightness_spin.valueChanged.connect(self._handle_level_spin_changed)
+        self.level_slider.valueChanged.connect(self.point_brightness_spin.setValue)
+        self.live_preview_checkbox.toggled.connect(self._handle_live_preview_toggled)
         self._load_from_config()
         self._schedule_undo_enabled = True
         self._clock_timer = QTimer(self)
@@ -1729,18 +1795,19 @@ class SettingsDialog(QDialog):
 
     def _update_location_controls(self) -> None:
         auto = self.auto_location_checkbox.isChecked()
-        self.latitude_spin.setEnabled(not auto)
-        self.longitude_spin.setEnabled(not auto)
+        self.latitude_spin.setVisible(not auto)
+        self.longitude_spin.setVisible(not auto)
         self.detect_location_button.setVisible(auto)
+        self.location_hint_label.setVisible(auto)
         if auto:
             if self._detected_location is not None:
                 self.location_hint_label.setText(f"Detected: {self._detected_location.region}")
             elif self._source_config.schedule.latitude is not None:
-                self.location_hint_label.setText("Using your last detected location.")
+                self.location_hint_label.setText("Using last detected location")
             else:
-                self.location_hint_label.setText("Location will be detected from your IP address.")
+                self.location_hint_label.setText("Detected from your IP address")
         else:
-            self.location_hint_label.setText("Enter your coordinates manually (decimal degrees).")
+            self.location_hint_label.setText("")
 
     def _handle_auto_location_toggled(self, _checked: bool) -> None:
         self._update_location_controls()
@@ -1763,9 +1830,7 @@ class SettingsDialog(QDialog):
         def finished(result, error) -> None:
             self.detect_location_button.setEnabled(True)
             if error is not None or result is None:
-                self.location_hint_label.setText(
-                    "Could not detect your location. Turn off auto-detect to enter it manually."
-                )
+                self.location_hint_label.setText("Couldn't detect. Turn off auto-detect to type it.")
                 return
             self._detected_location = result
             self._location_timezone_name = result.timezone_name or self._location_timezone_name
@@ -1858,8 +1923,8 @@ class SettingsDialog(QDialog):
         latitude = self._source_config.schedule.latitude
         longitude = self._source_config.schedule.longitude
         if latitude is None or longitude is None:
-            self.sunrise_time_label.setText("Sunrise --:--")
-            self.sunset_time_label.setText("Sunset --:--")
+            self.sunrise_time_label.setText("☀ --:--")
+            self.sunset_time_label.setText("☾ --:--")
             self.schedule_graph.set_sun_times(None, None)
             self._sun_times_cache_key = None
             return
@@ -1872,8 +1937,8 @@ class SettingsDialog(QDialog):
         else:
             timezone = current_time.astimezone().tzinfo
         if timezone is None:
-            self.sunrise_time_label.setText("Sunrise --:--")
-            self.sunset_time_label.setText("Sunset --:--")
+            self.sunrise_time_label.setText("☀ --:--")
+            self.sunset_time_label.setText("☾ --:--")
             self.schedule_graph.set_sun_times(None, None)
             self._sun_times_cache_key = None
             return
@@ -1905,8 +1970,8 @@ class SettingsDialog(QDialog):
 
         sunrise_text = sunrise_time.strftime("%H:%M") if sunrise_time is not None else "--:--"
         sunset_text = sunset_time.strftime("%H:%M") if sunset_time is not None else "--:--"
-        self.sunrise_time_label.setText(f"Sunrise {sunrise_text}")
-        self.sunset_time_label.setText(f"Sunset {sunset_text}")
+        self.sunrise_time_label.setText(f"☀ {sunrise_text}")
+        self.sunset_time_label.setText(f"☾ {sunset_text}")
         self.schedule_graph.set_sun_times(sunrise_time, sunset_time)
         self._sun_times_cache_key = cache_key
 
@@ -2165,9 +2230,90 @@ class SettingsDialog(QDialog):
         ]
         self._refresh_default_rules_button_state()
         self._sync_selected_rule_editor()
+        self._maybe_preview()
 
     def _handle_schedule_graph_selection_changed(self, _index: int) -> None:
         self._sync_selected_rule_editor()
+        self._maybe_preview()
+
+    # -- level slider + live preview ------------------------------------------------
+    @staticmethod
+    def _brightness_descriptor(value: int) -> str:
+        if value <= 8:
+            return "barely lit"
+        if value <= 25:
+            return "night-time dim"
+        if value <= 45:
+            return "evening dim"
+        if value <= 65:
+            return "comfortable"
+        if value <= 85:
+            return "bright"
+        return "full blast"
+
+    def _handle_level_spin_changed(self, value: int) -> None:
+        bounded = clamp_brightness(value)
+        self.level_slider.blockSignals(True)
+        self.level_slider.setValue(bounded)
+        self.level_slider.blockSignals(False)
+        self.level_value_label.setText(f"{bounded}%")
+        self.level_value_label.setStyleSheet(_big_value_style(bounded))
+        self.level_descriptor_label.setText(f"· {self._brightness_descriptor(bounded)}")
+        if not self._syncing_rule_editor:
+            self._maybe_preview()
+
+    def _preview_targets(self, target: str) -> list[MonitorHandle]:
+        handles = self.monitor_handles
+        if target == "display1":
+            return handles[:1]
+        if target == "display2":
+            return handles[1:2]
+        return list(handles)
+
+    def _maybe_preview(self) -> None:
+        if (
+            self._preview_writer is None
+            or not self._schedule_undo_enabled
+            or not self.live_preview_checkbox.isChecked()
+        ):
+            return
+        index = self.schedule_graph.selected_index()
+        if index < 0 or index >= len(self._schedule_rules):
+            return
+        rule = self._schedule_rules[index]
+        targets = self._preview_targets(rule.target)
+        target_keys = {monitor.key for monitor in targets}
+        # Put displays that are no longer being previewed back where they were.
+        for monitor in self.monitor_handles:
+            if monitor.key in self._previewed_keys and monitor.key not in target_keys:
+                original = self._original_levels.get(monitor.key)
+                if original is not None:
+                    self._preview_writer.submit(monitor, original)
+                self._previewed_keys.discard(monitor.key)
+        for monitor in targets:
+            self._preview_writer.submit(monitor, clamp_brightness(rule.brightness))
+            self._previewed_keys.add(monitor.key)
+
+    def _restore_preview(self) -> None:
+        if self._preview_writer is None:
+            return
+        for monitor in self.monitor_handles:
+            if monitor.key not in self._previewed_keys:
+                continue
+            original = self._original_levels.get(monitor.key)
+            if original is not None:
+                self._preview_writer.submit(monitor, original)
+        self._previewed_keys.clear()
+
+    def _handle_live_preview_toggled(self, checked: bool) -> None:
+        if checked:
+            self._maybe_preview()
+        else:
+            self._restore_preview()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        self._restore_preview()
+        super().done(result)
 
     def _set_combo_current_data(self, combo: QComboBox, value: str) -> None:
         index = combo.findData(value)
@@ -2197,6 +2343,7 @@ class SettingsDialog(QDialog):
             ):
                 widget.setEnabled(enabled)
             self.remove_rule_button.setEnabled(enabled)
+            self.level_panel.setEnabled(enabled)
 
             if selected_rule is None:
                 self.point_time_edit.clear()
@@ -2331,6 +2478,7 @@ class SettingsDialog(QDialog):
         self._schedule_rules[selected_index] = rule
         self.schedule_graph.set_rules(self._schedule_rules, selected_index=selected_index)
         self._refresh_default_rules_button_state()
+        self._maybe_preview()
         if time_is_source:
             self._syncing_rule_editor = True
             try:
@@ -2581,15 +2729,10 @@ class BrightnessControlWindow(QWidget):
 
         header_row = QHBoxLayout()
         header_row.setSpacing(10)
-        self.header_glyph = QLabel()
-        self.header_glyph.setPixmap(app_glyph_pixmap(44))
-        self.header_glyph.setScaledContents(True)
-        self.header_glyph.setFixedSize(24, 24)
-        header_row.addWidget(self.header_glyph)
-        self.title_label = QLabel("Remote Monitor Controller")
-        self.title_label.setObjectName("windowTitle")
-        header_row.addWidget(self.title_label)
-        header_row.addStretch(1)
+        self.info_label = QLabel("")
+        self.info_label.setObjectName("muted")
+        self.info_label.setWordWrap(True)
+        header_row.addWidget(self.info_label, stretch=1)
         self.refresh_button = _flat_tool_button("refresh", "Refresh monitors")
         self.settings_button = _flat_tool_button("settings", "Settings")
         header_row.addWidget(self.refresh_button)
@@ -2661,11 +2804,6 @@ class BrightnessControlWindow(QWidget):
         self.monitor_scroll.setWidget(self.monitor_scroll_content)
         monitors_layout.addWidget(self.monitor_scroll)
         root_layout.addWidget(self.monitors_group)
-
-        self.info_label = QLabel("")
-        self.info_label.setObjectName("hint")
-        self.info_label.setWordWrap(True)
-        root_layout.addWidget(self.info_label)
 
         self.refresh_button.clicked.connect(lambda _checked=False: self._handle_refresh_button())
         self.settings_button.clicked.connect(lambda _checked=False: self._open_settings_dialog())
@@ -3236,6 +3374,8 @@ class BrightnessControlWindow(QWidget):
             brightness_service=self.service,
             monitor_handles=monitor_handles,
             parent=self,
+            preview_writer=self._writer,
+            current_levels={row.monitor.key: row.slider.value() for row in self.monitor_rows},
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

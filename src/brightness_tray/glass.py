@@ -144,7 +144,29 @@ def paint_glass(widget: QWidget, painter: QPainter, theme: Theme | None = None) 
     shine.setColorAt(0.5, highlight)
     shine.setColorAt(1.0, QColor(255, 255, 255, 0))
     painter.fillRect(QRectF(rect.left(), rect.top(), rect.width(), 1.2), QBrush(shine))
+    if theme.shine:
+        # Liquid-glass sweep: a soft diagonal specular band plus a bottom-edge bounce light.
+        sweep = QLinearGradient(rect.topLeft(), QPointF(rect.left() + rect.width() * 0.55, rect.top() + rect.height() * 0.75))
+        sweep.setColorAt(0.0, QColor(255, 255, 255, 62))
+        sweep.setColorAt(0.45, QColor(255, 255, 255, 14))
+        sweep.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillRect(rect, QBrush(sweep))
+        bounce = QLinearGradient(0, rect.bottom() - 36, 0, rect.bottom())
+        bounce.setColorAt(0.0, QColor(255, 255, 255, 0))
+        bounce.setColorAt(1.0, QColor(190, 225, 255, 46))
+        painter.fillRect(rect, QBrush(bounce))
     painter.setClipping(False)
+
+    if theme.shine:
+        rim = QPainterPath()
+        rim.addRoundedRect(rect.adjusted(2.0, 2.0, -2.0, -2.0), max(2, radius - 2), max(2, radius - 2))
+        rim_gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        rim_gradient.setColorAt(0.0, QColor(255, 255, 255, 90))
+        rim_gradient.setColorAt(0.5, QColor(255, 255, 255, 12))
+        rim_gradient.setColorAt(1.0, QColor(200, 230, 255, 70))
+        painter.setPen(QPen(QBrush(rim_gradient), 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(rim)
 
     border = QLinearGradient(rect.topLeft(), rect.bottomRight())
     edge = qcolor(theme.border)
@@ -430,7 +452,7 @@ class ThemeSwatchButton(QPushButton):
         super().__init__(parent)
         self._theme_key = theme_key
         self.setCheckable(True)
-        self.setFixedSize(104, 62)
+        self.setFixedSize(94, 54)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(get_theme(theme_key).label)
 
@@ -444,10 +466,18 @@ class ThemeSwatchButton(QPushButton):
         path = QPainterPath()
         path.addRoundedRect(rect, 13, 13)
         base = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        top = qcolor(theme.top, 255)
-        bottom = qcolor(theme.bottom, 255)
-        base.setColorAt(0.0, top)
-        base.setColorAt(1.0, bottom)
+        if theme.shine:
+            # Show a "see-through" swatch: a wallpaper-ish backdrop under the clear tint.
+            backdrop = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            backdrop.setColorAt(0.0, QColor("#ff8a65"))
+            backdrop.setColorAt(0.5, QColor("#8b5cf6"))
+            backdrop.setColorAt(1.0, QColor("#22d3ee"))
+            painter.fillPath(path, QBrush(backdrop))
+            base.setColorAt(0.0, QColor(255, 255, 255, 70))
+            base.setColorAt(1.0, QColor(20, 24, 40, 70))
+        else:
+            base.setColorAt(0.0, qcolor(theme.top, 255))
+            base.setColorAt(1.0, qcolor(theme.bottom, 255))
         painter.fillPath(path, QBrush(base))
 
         painter.save()
